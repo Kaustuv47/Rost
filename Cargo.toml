@@ -2,12 +2,22 @@
 name = "Rost"
 version = "0.1.0"
 edition = "2021"
+description = "A minimal x86_64 UEFI microkernel written in Rust"
+authors = ["Rost Contributors"]
 
 [dependencies]
-uefi = "0.27"
-
-[profile.dev]
-panic = "abort"
+uefi = { version = "0.26", default-features = false, features = ["alloc"] }
+log = "0.4"
 
 [profile.release]
-panic = "abort"
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+
+[[bin]]
+name = "Rost"
+path = "src/main.rs"

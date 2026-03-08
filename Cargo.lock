@@ -6,6 +6,7 @@ version = 4
 name = "Rost"
 version = "0.1.0"
 dependencies = [
+ "log",
  "uefi",
 ]
 
@@ -58,9 +59,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.44"
+version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21b2ebcf727b7760c461f091f9f0f539b77b8e87f2fd88131e7f1b433b3cece4"
+checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
 ]
@@ -98,9 +99,9 @@ dependencies = [
 
 [[package]]
 name = "uefi"
-version = "0.27.0"
+version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89ee9c34c612d45735fef4c478450cd2a1e64e59ad1e5988e5024af53914a854"
+checksum = "07ead9f748a4646479b850add36b527113a80e80a7e0f44d7b0334291850dcc5"
 dependencies = [
  "bitflags",
  "log",
