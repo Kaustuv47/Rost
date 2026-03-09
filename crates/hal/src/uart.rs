@@ -1,23 +1,13 @@
 const COM1: u16 = 0x3F8;
 
 unsafe fn outb(port: u16, value: u8) {
-    core::arch::asm!(
-        "out dx, al",
-        in("dx") port,
-        in("al") value,
-        options(nostack)
-    );
+    core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nostack));
 }
 
 unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    core::arch::asm!(
-        "in al, dx",
-        in("dx") port,
-        out("al") value,
-        options(nostack)
-    );
-    value
+    let v: u8;
+    core::arch::asm!("in al, dx", in("dx") port, out("al") v, options(nostack));
+    v
 }
 
 /// Initialize COM1 at 38400 baud, 8N1
@@ -33,9 +23,10 @@ pub fn init() {
     }
 }
 
+/// Transmit one byte; auto-appends CR after LF
 pub fn put_byte(byte: u8) {
     unsafe {
-        while inb(COM1 + 5) & 0x20 == 0 {} // Wait for transmit buffer empty
+        while inb(COM1 + 5) & 0x20 == 0 {}
         outb(COM1, byte);
         if byte == b'\n' {
             while inb(COM1 + 5) & 0x20 == 0 {}
@@ -44,14 +35,10 @@ pub fn put_byte(byte: u8) {
     }
 }
 
-/// Returns the next byte from COM1 if one is available (non-blocking).
+/// Returns the next byte from COM1 if one is available (non-blocking)
 pub fn read_byte() -> Option<u8> {
     unsafe {
-        if inb(COM1 + 5) & 0x01 != 0 {
-            Some(inb(COM1))
-        } else {
-            None
-        }
+        if inb(COM1 + 5) & 0x01 != 0 { Some(inb(COM1)) } else { None }
     }
 }
 

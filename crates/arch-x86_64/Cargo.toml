@@ -1,0 +1,5 @@
+[package]
+name = "arch-x86_64"
+version = "0.1.0"
+edition = "2021"
+description = "x86_64 architecture layer — GDT, IDT, interrupt handlers, PIT/PIC"

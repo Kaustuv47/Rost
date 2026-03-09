@@ -1,7 +1,6 @@
-use crate::process::{ProcessId, ProcessTable, ProcessState};
 use core::cell::RefCell;
+use crate::process::{ProcessId, ProcessState, ProcessTable};
 
-/// Round-robin scheduler
 pub struct Scheduler {
     process_table: RefCell<ProcessTable>,
     current_process: RefCell<Option<ProcessId>>,
@@ -9,7 +8,6 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    /// Create a new scheduler
     pub fn new() -> Self {
         Scheduler {
             process_table: RefCell::new(ProcessTable::new()),
@@ -18,42 +16,31 @@ impl Scheduler {
         }
     }
 
-    /// Add a process to the scheduler
     pub fn add_process(&self, entry_point: u64, stack_addr: u64) -> Option<ProcessId> {
         self.process_table.borrow_mut().create_process(entry_point, stack_addr)
     }
 
-    /// Schedule the next process (round-robin)
     pub fn schedule(&self) -> Option<ProcessId> {
         let table = self.process_table.borrow();
-        let ready_pids = table.get_ready_processes();
+        let ready = table.get_ready_processes();
+        if ready.is_empty() { return None; }
 
-        if ready_pids.is_empty() {
-            return None;
-        }
-
-        let mut queue_idx = self.queue_index.borrow_mut();
-        if *queue_idx >= ready_pids.len() {
-            *queue_idx = 0;
-        }
-
-        let next_pid = ready_pids[*queue_idx];
-        *queue_idx += 1;
-
-        *self.current_process.borrow_mut() = Some(next_pid);
-        Some(next_pid)
+        let mut idx = self.queue_index.borrow_mut();
+        if *idx >= ready.len() { *idx = 0; }
+        let next = ready[*idx];
+        *idx += 1;
+        *self.current_process.borrow_mut() = Some(next);
+        Some(next)
     }
 
-    /// Get current process
     pub fn current_process(&self) -> Option<ProcessId> {
         *self.current_process.borrow()
     }
 
-    /// Context switch to next process
     pub fn context_switch(&self) {
-        if let Some(next_pid) = self.schedule() {
+        if let Some(pid) = self.schedule() {
             let mut table = self.process_table.borrow_mut();
-            if let Some(pcb) = table.get_process(next_pid) {
+            if let Some(pcb) = table.get_process(pid) {
                 pcb.state = ProcessState::Running;
                 pcb.restore_context();
             }

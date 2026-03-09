@@ -2,7 +2,7 @@
 
 A minimal x86_64 UEFI microkernel written in Rust (`no_std`).
 
-The kernel does exactly 8 things. Everything else — filesystems, drivers, shells, applications — runs as isolated userspace processes communicating through IPC.
+The kernel does exactly 8 things. Everything else — filesystems, drivers, applications — runs as isolated userspace processes communicating through IPC.
 
 ---
 
@@ -30,33 +30,105 @@ The kernel does exactly 8 things. Everything else — filesystems, drivers, shel
 │                                                               │
 ├───────────────────────────────────────────────────────────────┤
 │                  UEFI Firmware / Hardware                      │
-└───────────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Project Structure
+
+Cargo workspace with 4 crates, each with a single responsibility:
+
+```
+crates/
+├── kernel/                     # Binary — UEFI entry point, shell
+│   └── src/
+│       ├── main.rs             # efi_main, BumpAllocator, panic handler, init sequence
+│       └── shell/
+│           ├── mod.rs          # Interactive read loop, prompt
+│           └── commands.rs     # Command dispatch (echo, help)
+│
+├── arch-x86_64/                # x86_64 hardware layer
+│   └── src/
+│       ├── cpu/
+│       │   ├── gdt.rs          # GdtEntry, GlobalDescriptorTable
+│       │   ├── idt.rs          # IdtEntry, InterruptDescriptorTable
+│       │   └── mod.rs          # enable_interrupts, disable_interrupts, halt
+│       ├── interrupts/
+│       │   ├── handlers.rs     # Naked ISR stubs (#[unsafe(naked)])
+│       │   └── mod.rs          # init() — wires handlers into IDT
+│       └── timer/
+│           ├── pic.rs          # PIC 8259 master/slave config
+│           └── mod.rs          # PIT 100 Hz init
+│
+├── hal/                        # Hardware Abstraction Layer — device drivers
+│   └── src/
+│       └── uart.rs             # COM1 UART: init, put_byte, read_byte, print_str, print_hex
+│
+└── core-kernel/                # Architecture-independent kernel logic
+    └── src/
+        ├── memory/
+        │   ├── physical.rs     # PhysicalAllocator (bump)
+        │   └── paging.rs       # PageTable, map_page, translate_address
+        ├── process/
+        │   ├── mod.rs          # ProcessId
+        │   ├── pcb.rs          # ProcessControlBlock, ProcessState
+        │   └── table.rs        # ProcessTable (max 32 processes)
+        ├── scheduler/
+        │   └── round_robin.rs  # Round-robin Scheduler
+        └── ipc/
+            └── message.rs      # Message, MessageQueue (capacity 16)
+
+build/
+└── efi/boot/
+    └── bootx64.efi             # Deployed UEFI binary (output of scripts/build.sh)
+
+scripts/
+├── build.sh                    # cargo build + copy .efi to build/
+└── run.sh                      # QEMU launch command
+
+.cargo/
+└── config.toml                 # Default target: x86_64-unknown-uefi
+```
+
+**Crate dependency graph:**
+```
+kernel  ──►  arch-x86_64
+        ──►  hal
+        ──►  core-kernel
+        ──►  uefi
+
+arch-x86_64  ──►  (nothing)
+hal          ──►  (nothing)
+core-kernel  ──►  (nothing, uses alloc)
+```
+
+`core-kernel` has no architecture or hardware dependencies — its logic can be unit-tested on the host with `cargo test -p core-kernel --target <host>`.
 
 ---
 
 ## The 8 Kernel Modules
 
-### 1. Boot code — `src/main.rs`, `src/cpu.rs`, `src/console.rs`
+### 1. Boot & CPU setup — `crates/kernel/src/main.rs`, `crates/arch-x86_64/`
 
 Brings the CPU to a known state after UEFI hands over control.
 
 - UEFI entry point via `#[entry]` (uefi crate, no bootloader needed)
 - Global Descriptor Table: 3 selectors — null, 64-bit code (`0x08`), data (`0x10`)
 - Interrupt Descriptor Table: 256 gates, loaded from a `static` (not the stack)
-- Console: COM1 serial at 38400 baud 8N1, port I/O — works in long mode
+- Serial console: COM1 at 38400 baud 8N1, port I/O — works in long mode
 
-**What's done:** UEFI boot, GDT, IDT, serial console
-**What's missing:** GOP framebuffer (QEMU window is blank; serial works)
+**What's done:** UEFI boot, GDT, IDT, serial console, interactive shell
+**What's missing:** GOP framebuffer (QEMU window is blank; serial is the console)
 
 ---
 
-### 2. Memory management — `src/memory.rs`
+### 2. Memory management — `crates/core-kernel/src/memory/`
 
 Owns all physical memory and virtual address spaces.
 
-- Physical allocator: bump allocator (no deallocation yet)
-- Page tables: simplified single-level (placeholder)
+- Physical allocator: bump allocator (`physical.rs`), 4 KB page-aligned
+- Page tables: simplified single-level (`paging.rs`) — placeholder for 4-level PML4
 - `map_page`, `translate_address` exist but page table is not wired to CR3
 
 **What's done:** allocator skeleton, page table types
@@ -64,7 +136,7 @@ Owns all physical memory and virtual address spaces.
 
 ---
 
-### 3. Interrupt handling — `src/interrupts.rs`
+### 3. Interrupt handling — `crates/arch-x86_64/src/interrupts/`
 
 Handles all CPU exceptions and hardware interrupts.
 
@@ -78,28 +150,28 @@ Handles all CPU exceptions and hardware interrupts.
 Handlers use `#[unsafe(naked)]` with hand-written `iretq` — required on stable Rust (no `abi_x86_interrupt`).
 
 **What's done:** All handlers registered, ISRs don't crash the kernel
-**What's missing:** Exception handlers print nothing before halting — serial output needed for debugging
+**What's missing:** Exception handlers print nothing before halting — register dump over serial needed for debugging
 
 ---
 
-### 4. Process management — `src/process.rs`
+### 4. Process management — `crates/core-kernel/src/process/`
 
 Creates and destroys processes; owns per-process state.
 
-- `ProcessControlBlock`: holds GPRs (rax–rdi, rsp, rbp, rip, rflags), `page_table_base`, time slice
-- `ProcessTable`: fixed array of up to 32 slots
+- `ProcessControlBlock` (`pcb.rs`): holds GPRs (rax–rdi, rsp, rbp, rip, rflags), `page_table_base`, time slice
+- `ProcessTable` (`table.rs`): fixed array of up to 32 slots
 - `create_process(entry, stack)`, `terminate_process(pid)`, `get_ready_processes()`
 
 **What's done:** PCB data structure, create/terminate, process table
-**What's missing:** r8–r15 missing from PCB, per-process kernel stack, address space isolation (page_table_base = 0), ring-3 execution, ELF loader
+**What's missing:** r8–r15 missing from PCB, per-process kernel stack, address space isolation, ring-3 execution, ELF loader
 
 ---
 
-### 5. Scheduling — `src/scheduler.rs`
+### 5. Scheduling — `crates/core-kernel/src/scheduler/`
 
 Decides which process runs next; performs the context switch.
 
-- Round-robin over all `Ready` processes
+- Round-robin over all `Ready` processes (`round_robin.rs`)
 - `schedule()` returns the next PID
 - `context_switch()` calls `restore_context()` — **currently a stub**
 
@@ -108,15 +180,15 @@ Decides which process runs next; performs the context switch.
 
 ---
 
-### 6. IPC — `src/ipc.rs`
+### 6. IPC — `crates/core-kernel/src/ipc/`
 
 Passes messages between processes — the only way userspace servers communicate.
 
-- `Message`: sender PID + 8×u64 payload (72 bytes)
+- `Message` (`message.rs`): sender PID + 8×u64 payload (72 bytes)
 - `MessageQueue`: circular buffer, capacity 16, non-blocking `send`/`receive`
 
 **What's done:** Message and queue data structures, circular buffer logic
-**What's missing:** Queues not attached to processes, no blocking receive (process should block on empty queue, not busy-wait), no integration with syscall layer
+**What's missing:** Queues not attached to processes, no blocking receive, no integration with syscall layer
 
 ---
 
@@ -127,7 +199,7 @@ The only legal crossing point from ring 3 into ring 0.
 Planned implementation:
 - `SYSCALL`/`SYSRET` via STAR, LSTAR, SFMASK MSRs
 - Naked assembly entry stub — switches to kernel stack (TSS.RSP0), saves user registers
-- Rust dispatcher in `src/syscall.rs`
+- Rust dispatcher in `crates/kernel/src/syscall.rs`
 
 Minimum viable syscall table:
 
@@ -142,12 +214,12 @@ Minimum viable syscall table:
 
 ---
 
-### 8. Timer — `src/timer.rs`
+### 8. Timer — `crates/arch-x86_64/src/timer/`
 
 Provides the heartbeat that drives the scheduler.
 
-- PIT channel 0 configured for 100 Hz (10 ms ticks), divisor 11932
-- PIC master (0x20) and slave (0xA0) initialised, IRQ0 unmasked
+- PIT channel 0 at 100 Hz (10 ms ticks), divisor 11932 (`mod.rs`)
+- PIC master (0x20) and slave (0xA0) initialised, IRQ0 unmasked (`pic.rs`)
 - IRQ0 → IDT vector 32 → `timer_interrupt_handler`
 
 **What's done:** PIT + PIC hardware fully configured, timer ISR fires
@@ -155,27 +227,24 @@ Provides the heartbeat that drives the scheduler.
 
 ---
 
-## Project Structure
+## Shell
+
+The kernel exposes a serial shell after boot. Connect via `-serial stdio` in QEMU.
 
 ```
-src/
-├── main.rs        Boot entry, global allocator, static GDT/IDT
-├── console.rs     COM1 serial output (UART port I/O)
-├── cpu.rs         GDT, IDT structs + load; sti/cli/hlt wrappers
-├── interrupts.rs  Naked ISR stubs for exceptions + timer
-├── timer.rs       PIT 100 Hz + PIC master/slave init
-├── memory.rs      Physical allocator, page table types
-├── process.rs     ProcessControlBlock, ProcessTable
-├── scheduler.rs   Round-robin Scheduler
-└── ipc.rs         Message, MessageQueue
+rost> echo "Hello, Rost!"
+Hello, Rost!
 
-build/
-└── efi/boot/
-    └── bootx64.efi   UEFI boot binary (copy of Rost.efi after build)
+rost> echo Hello World
+Hello World
 
-.cargo/
-└── config.toml       default target = x86_64-unknown-uefi
+rost> help
+Commands:
+  echo <text>   print text to console
+  help          show this message
 ```
+
+Backspace and line editing are supported. The shell polls COM1 and falls back to `hlt` between keystrokes so the CPU is not busy-waiting.
 
 ---
 
@@ -190,25 +259,25 @@ build/
 
 ---
 
-## Build
+## Build & Run
+
+**Build and deploy the EFI binary:**
 
 ```sh
-cargo build
-# Output: target/x86_64-unknown-uefi/debug/Rost.efi
+./scripts/build.sh
+# Compiles all workspace crates and copies Rost.efi → build/efi/boot/bootx64.efi
 
-cargo build --release
-# Output: target/x86_64-unknown-uefi/release/Rost.efi
+./scripts/build.sh --release
+# Release build (LTO, stripped)
 ```
 
-Copy to boot directory after building:
+**Run in QEMU:**
 
 ```sh
-cp target/x86_64-unknown-uefi/debug/Rost.efi build/efi/boot/bootx64.efi
+./scripts/run.sh
 ```
 
----
-
-## Run (QEMU, macOS with MacPorts)
+Which expands to:
 
 ```sh
 qemu-system-x86_64 \
@@ -222,7 +291,7 @@ qemu-system-x86_64 \
   -serial stdio
 ```
 
-Kernel output appears in the **terminal** (serial stdio). The QEMU window will be blank until the GOP framebuffer console is implemented.
+Kernel output and the shell appear in the **terminal** (serial stdio). The QEMU window will be blank until a GOP framebuffer console is implemented.
 
 Exit QEMU: `Ctrl+A` then `X`.
 
@@ -236,24 +305,25 @@ Ordered by dependency — each phase unlocks the next.
 
 ```
 Phase 1 — Memory  (unblocks everything else)
-  [ ] #3  4-level page tables (PML4→PDPT→PD→PT), per-process CR3
-  [ ] #4  Buddy allocator + UEFI memory map integration
+  [ ] 4-level page tables (PML4→PDPT→PD→PT), per-process CR3
+  [ ] Buddy allocator + UEFI memory map integration
 
 Phase 2 — CPU Mechanics
-  [ ] #1  GOP framebuffer console (visible output in QEMU window)
-  [ ] #12 Exception handlers: print register dump over serial before halting
-  [ ] #2  Real context switch: save/restore all GPRs in timer ISR, switch CR3
-  [ ] #14 Wire timer ISR to scheduler (time-slice expiry → context switch)
+  [ ] GOP framebuffer console (visible output in QEMU window)
+  [ ] Exception handlers: print register dump over serial before halting
+  [ ] Real context switch: save/restore all GPRs in timer ISR, switch CR3
+  [ ] Wire timer ISR to scheduler (time-slice expiry → context switch)
 
 Phase 3 — Userspace Boundary
-  [ ] #6  Process management: r8–r15 in PCB, kernel stack, ELF loader, ring-3 entry
-  [ ] #5  System calls: SYSCALL/SYSRET, TSS.RSP0, minimal dispatcher (6 syscalls)
+  [ ] Process management: r8–r15 in PCB, kernel stack, ELF loader, ring-3 entry
+  [ ] System calls: SYSCALL/SYSRET, TSS.RSP0, minimal dispatcher (6 syscalls)
 
 Phase 4 — IPC
-  [ ] #13 Per-process message queues with blocking recv (integrate with scheduler)
+  [ ] Per-process message queues with blocking recv (integrate with scheduler)
 
-Phase 5 — Tooling
-  [ ] #10 Makefile: build, run, run-serial, release targets
+Phase 5 — Servers
+  [ ] VFS server (userspace)
+  [ ] Init process (PID 1)
 ```
 
 ---
@@ -270,7 +340,10 @@ UEFI `SimpleTextOutput` is gone after `ExitBootServices()`. Serial port I/O work
 `extern "x86-interrupt"` is nightly-only. Naked functions are stable since Rust 1.85 and give exact control over the `iretq` sequence.
 
 **Why static GDT and IDT?**
-The CPU reads the GDT on every segment reload and the IDT on every interrupt. Stack-allocated GDT/IDT will be overwritten by interrupt nesting. `static mut` puts them at a fixed address for the kernel lifetime.
+The CPU reads the GDT on every segment reload and the IDT on every interrupt. Stack-allocated GDT/IDT will be overwritten by interrupt nesting. `static` puts them at a fixed address for the kernel lifetime. GDT is a plain `static` (immutable); IDT is `static mut` accessed via raw pointer to avoid UB on the mutable reference.
+
+**Why a Cargo workspace?**
+Each crate has a single responsibility and a clean dependency boundary. `core-kernel` has no architecture or hardware dependencies, so its logic (scheduler, IPC, memory) can be unit-tested on the host without QEMU. Adding a second architecture (`aarch64`) would only require a new `arch-aarch64` crate — nothing else changes.
 
 **Why only 8 kernel modules?**
 Microkernel principle: a kernel bug is a security hole. Filesystems, drivers, and protocols all crash in userspace — they can be restarted without rebooting. Only the 8 modules above require ring 0.

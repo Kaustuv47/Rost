@@ -1,0 +1,5 @@
+[package]
+name = "core-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Architecture-independent kernel logic — memory, process, scheduler, IPC"

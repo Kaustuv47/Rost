@@ -1,0 +1,15 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Rost microkernel — UEFI entry point and shell"
+
+[[bin]]
+name = "Rost"
+path = "src/main.rs"
+
+[dependencies]
+uefi = { version = "0.26", default-features = false, features = ["alloc"] }
+arch-x86_64 = { path = "../arch-x86_64" }
+hal = { path = "../hal" }
+core-kernel = { path = "../core-kernel" }
