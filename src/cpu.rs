@@ -14,7 +14,7 @@ pub struct GdtEntry {
 
 impl GdtEntry {
     /// Create a null GDT entry
-    pub fn null() -> Self {
+    pub const fn null() -> Self {
         GdtEntry {
             limit_low: 0,
             base_low: 0,
@@ -25,26 +25,26 @@ impl GdtEntry {
         }
     }
 
-    /// Create a code segment GDT entry
-    pub fn code() -> Self {
+    /// Create a 64-bit code segment GDT entry
+    pub const fn code() -> Self {
         GdtEntry {
             limit_low: 0xFFFF,
             base_low: 0,
             base_mid: 0,
-            access: 0x9A,           // Present, Ring 0, Code segment
-            limit_high_and_flags: 0xCF, // 4KB granularity, 64-bit
+            access: 0x9A,               // Present, Ring 0, executable, readable
+            limit_high_and_flags: 0xAF, // G=1, L=1 (64-bit), D=0, limit_high=0xF
             base_high: 0,
         }
     }
 
     /// Create a data segment GDT entry
-    pub fn data() -> Self {
+    pub const fn data() -> Self {
         GdtEntry {
             limit_low: 0xFFFF,
             base_low: 0,
             base_mid: 0,
-            access: 0x92,           // Present, Ring 0, Data segment
-            limit_high_and_flags: 0xCF, // 4KB granularity, 64-bit
+            access: 0x92,               // Present, Ring 0, writable data
+            limit_high_and_flags: 0xCF, // G=1, 4KB granularity
             base_high: 0,
         }
     }
@@ -64,7 +64,7 @@ pub struct GlobalDescriptorTable {
 
 impl GlobalDescriptorTable {
     /// Create a new GDT
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         GlobalDescriptorTable {
             entries: [
                 GdtEntry::null(),
@@ -129,7 +129,7 @@ pub struct IdtEntry {
 
 impl IdtEntry {
     /// Create a null IDT entry
-    pub fn null() -> Self {
+    pub const fn null() -> Self {
         IdtEntry {
             offset_low: 0,
             selector: 0,
@@ -169,7 +169,7 @@ pub struct InterruptDescriptorTable {
 
 impl InterruptDescriptorTable {
     /// Create a new IDT
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         InterruptDescriptorTable {
             entries: [IdtEntry::null(); 256],
         }

@@ -55,12 +55,17 @@ static ALLOCATOR: BumpAllocator = BumpAllocator {
     offset: core::sync::atomic::AtomicUsize::new(0),
 };
 
+// GDT and IDT must be static — the CPU reads them on every interrupt
+static mut GDT: cpu::GlobalDescriptorTable = cpu::GlobalDescriptorTable::new();
+static mut IDT: cpu::InterruptDescriptorTable = cpu::InterruptDescriptorTable::new();
+
 // =============================================================================
 // ENTRY POINT
 // =============================================================================
 
 #[entry]
 fn efi_main(_image_handle: Handle, _system_table: SystemTable<Boot>) -> Status {
+    console::init();
     console::print_str("\n");
     console::print_str("╔════════════════════════════════════╗\n");
     console::print_str("║   Rost Microkernel v0.1.0         ║\n");
@@ -92,13 +97,12 @@ fn efi_main(_image_handle: Handle, _system_table: SystemTable<Boot>) -> Status {
     // -------------------------------------------------------------------------
     console::print_str("[2/7] CPU Setup (GDT/IDT)\n");
 
-    let gdt = cpu::GlobalDescriptorTable::new();
-    gdt.load();
+    unsafe {
+        GDT.load();
+        interrupts::init(&mut IDT);
+        IDT.load();
+    }
     console::print_str("      └─ GDT loaded:      3 selectors (null, code, data)\n");
-
-    let mut idt = cpu::InterruptDescriptorTable::new();
-    interrupts::init(&mut idt);
-    idt.load();
     console::print_str("      └─ IDT loaded:      256 gates registered\n");
     console::print_str("      └─ Status:          ✓ OK\n\n");
 
@@ -177,11 +181,85 @@ fn efi_main(_image_handle: Handle, _system_table: SystemTable<Boot>) -> Status {
     cpu::enable_interrupts();
 
     console::print_str("✓ Interrupts enabled\n");
-    console::print_str("✓ Entering kernel idle loop\n");
-    console::print_str("\nRost is running...\n\n");
+    console::print_str("✓ Entering kernel shell\n");
+    console::print_str("\nType 'help' for available commands.\n\n");
+
+    // --------------------------------------------------------------------------
+    // Simple interactive shell
+    // --------------------------------------------------------------------------
+    let mut cmd_buf = [0u8; 256];
+    let mut cmd_len: usize = 0;
+
+    console::print_str("rost> ");
 
     loop {
-        cpu::halt(); // Halt CPU until next interrupt
+        if let Some(byte) = console::read_byte() {
+            match byte {
+                b'\r' | b'\n' => {
+                    console::put_byte(b'\n');
+                    if cmd_len > 0 {
+                        shell_exec(&cmd_buf[..cmd_len]);
+                        cmd_len = 0;
+                    }
+                    console::print_str("rost> ");
+                }
+                // Backspace (BS = 0x08, DEL = 0x7F)
+                0x08 | 0x7F => {
+                    if cmd_len > 0 {
+                        cmd_len -= 1;
+                        console::put_byte(0x08);
+                        console::put_byte(b' ');
+                        console::put_byte(0x08);
+                    }
+                }
+                b if b >= 0x20 && cmd_len < 255 => {
+                    cmd_buf[cmd_len] = b;
+                    cmd_len += 1;
+                    console::put_byte(b); // local echo
+                }
+                _ => {}
+            }
+        } else {
+            cpu::halt(); // wait for next interrupt (timer @ 100 Hz)
+        }
+    }
+}
+
+// =============================================================================
+// SHELL COMMAND DISPATCH
+// =============================================================================
+
+fn trim(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(s.len());
+    let end = s.iter().rposition(|&b| b != b' ' && b != b'\t').map(|i| i + 1).unwrap_or(0);
+    if start >= end { b"" } else { &s[start..end] }
+}
+
+fn shell_exec(line: &[u8]) {
+    let line = trim(line);
+
+    if line.starts_with(b"echo") {
+        let rest = trim(&line[4..]);
+        // Strip surrounding double-quotes if present
+        let text = if rest.len() >= 2 && rest[0] == b'"' && rest[rest.len() - 1] == b'"' {
+            &rest[1..rest.len() - 1]
+        } else {
+            rest
+        };
+        for &b in text {
+            console::put_byte(b);
+        }
+        console::put_byte(b'\n');
+    } else if line == b"help" {
+        console::print_str("Commands:\n");
+        console::print_str("  echo <text>   print text to console\n");
+        console::print_str("  help          show this message\n");
+    } else if !line.is_empty() {
+        console::print_str("Unknown command: '");
+        for &b in line {
+            console::put_byte(b);
+        }
+        console::print_str("'\n");
     }
 }
 
@@ -202,6 +280,7 @@ fn panic(info: &PanicInfo) -> ! {
     }
 
     console::print_str("\nSystem halted.\n");
+
 
     loop {
         cpu::halt();
