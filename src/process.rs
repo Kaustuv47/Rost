@@ -1,5 +1,7 @@
 use alloc::vec::Vec;
 
+const MAX_PROCESSES: usize = 32;
+
 /// Process state enumeration
 #[derive(Copy, Clone, Debug)]
 pub enum ProcessState {
@@ -90,7 +92,7 @@ impl ProcessControlBlock {
 
 /// Process table for managing all processes
 pub struct ProcessTable {
-    processes: [Option<ProcessControlBlock>; 32],
+    processes: [Option<ProcessControlBlock>; MAX_PROCESSES],
     next_pid: u32,
 }
 
@@ -113,9 +115,9 @@ impl ProcessTable {
         let pid = ProcessId::new(self.next_pid);
         self.next_pid += 1;
 
-        for i in 0..32 {
-            if self.processes[i].is_none() {
-                self.processes[i] = Some(ProcessControlBlock::new(pid, entry_point, stack_addr));
+        for slot in self.processes.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(ProcessControlBlock::new(pid, entry_point, stack_addr));
                 return Some(pid);
             }
         }
@@ -124,39 +126,24 @@ impl ProcessTable {
 
     /// Get a process by ID
     pub fn get_process(&mut self, pid: ProcessId) -> Option<&mut ProcessControlBlock> {
-        for i in 0..32 {
-            if let Some(ref mut pcb) = self.processes[i] {
-                if pcb.pid == pid {
-                    return Some(&mut self.processes[i] as &mut Option<ProcessControlBlock>)
-                        .and_then(|opt| opt.as_mut());
-                }
-            }
-        }
-        None
+        self.processes.iter_mut()
+            .filter_map(|slot| slot.as_mut())
+            .find(|pcb| pcb.pid == pid)
     }
 
     /// Terminate a process
     pub fn terminate_process(&mut self, pid: ProcessId) {
-        for i in 0..32 {
-            if let Some(ref mut pcb) = self.processes[i] {
-                if pcb.pid == pid {
-                    pcb.state = ProcessState::Terminated;
-                    return;
-                }
-            }
+        if let Some(pcb) = self.get_process(pid) {
+            pcb.state = ProcessState::Terminated;
         }
     }
 
     /// Get all ready processes
-    pub fn get_ready_processes(&mut self) -> Vec<ProcessId> {
-        let mut ready = Vec::new();
-        for i in 0..32 {
-            if let Some(ref pcb) = self.processes[i] {
-                if matches!(pcb.state, ProcessState::Ready) {
-                    ready.push(pcb.pid);
-                }
-            }
-        }
-        ready
+    pub fn get_ready_processes(&self) -> Vec<ProcessId> {
+        self.processes.iter()
+            .filter_map(|slot| slot.as_ref())
+            .filter(|pcb| matches!(pcb.state, ProcessState::Ready))
+            .map(|pcb| pcb.pid)
+            .collect()
     }
 }

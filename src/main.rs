@@ -15,8 +15,7 @@ mod process;
 mod scheduler;
 mod timer;
 
-// Re-export process types used by other modules
-pub use process::{ProcessId, ProcessTable, ProcessState, ProcessControlBlock};
+use process::ProcessId;
 
 // =============================================================================
 // GLOBAL ALLOCATOR - Simple bump allocator for early kernel development
@@ -147,7 +146,7 @@ fn efi_main(_image_handle: Handle, _system_table: SystemTable<Boot>) -> Status {
     console::print_str("      └─ First process:   ");
     if let Some(pid) = first_process {
         console::print_str("PID ");
-        console::print_hex(pid.0 as u64);
+        console::print_hex(pid.as_u32() as u64);
     }
     console::print_str("\n");
     console::print_str("      └─ Status:          ✓ OK\n\n");

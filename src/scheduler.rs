@@ -25,7 +25,7 @@ impl Scheduler {
 
     /// Schedule the next process (round-robin)
     pub fn schedule(&self) -> Option<ProcessId> {
-        let mut table = self.process_table.borrow_mut();
+        let table = self.process_table.borrow();
         let ready_pids = table.get_ready_processes();
 
         if ready_pids.is_empty() {

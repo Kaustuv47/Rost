@@ -1,8 +1,7 @@
-/// Physical memory allocator (simplified buddy allocator)
+/// Physical memory allocator (simplified bump allocator)
 pub struct PhysicalAllocator {
     heap_start: usize,
-    heap_size: usize,
-    free_blocks: [usize; 64], // Track free blocks at different sizes
+    heap_remaining: usize,
 }
 
 impl PhysicalAllocator {
@@ -10,19 +9,20 @@ impl PhysicalAllocator {
     pub fn new(start: usize, size: usize) -> Self {
         PhysicalAllocator {
             heap_start: start,
-            heap_size: size,
-            free_blocks: [0; 64],
+            heap_remaining: size,
         }
     }
 
     /// Allocate physical memory (simplified - returns sequential blocks)
     pub fn allocate(&mut self, size: usize) -> Option<usize> {
         // Simplified allocator — in production use a proper buddy system
-        if size > self.heap_size {
+        let aligned_size = ((size + 4095) / 4096) * 4096; // Align to 4KB pages
+        if aligned_size > self.heap_remaining {
             return None;
         }
         let addr = self.heap_start;
-        self.heap_start += ((size + 4095) / 4096) * 4096; // Align to 4KB pages
+        self.heap_start += aligned_size;
+        self.heap_remaining -= aligned_size;
         Some(addr)
     }
 
@@ -84,7 +84,11 @@ impl PageTable {
 
     /// Get a page table entry
     pub fn get_entry(&self, index: usize) -> PageTableEntry {
-        self.entries[index]
+        if index < 512 {
+            self.entries[index]
+        } else {
+            PageTableEntry(0)
+        }
     }
 }
 
