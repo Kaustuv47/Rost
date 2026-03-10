@@ -4,6 +4,7 @@ const QUEUE_CAPACITY: usize = 16;
 const DATA_FIELDS: usize = 8;
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct Message {
     pub sender: ProcessId,
     pub data: [u64; DATA_FIELDS],
@@ -60,4 +61,5 @@ impl MessageQueue {
     }
 
     pub fn is_empty(&self) -> bool { self.count == 0 }
+    pub fn is_full(&self) -> bool  { self.count >= QUEUE_CAPACITY }
 }

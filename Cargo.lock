@@ -5,6 +5,10 @@ version = 4
 [[package]]
 name = "arch-x86_64"
 version = "0.1.0"
+dependencies = [
+ "core-kernel",
+ "hal",
+]
 
 [[package]]
 name = "bit_field"

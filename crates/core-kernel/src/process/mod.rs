@@ -1,7 +1,7 @@
-mod pcb;
+pub mod pcb;
 mod table;
 
-pub use pcb::{ProcessControlBlock, ProcessState};
+pub use pcb::{ProcessControlBlock, ProcessState, TaskContext};
 pub use table::ProcessTable;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

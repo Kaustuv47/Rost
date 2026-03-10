@@ -23,11 +23,11 @@ impl ProcessTable {
     }
 
     pub fn create_process(&mut self, entry_point: u64, stack_addr: u64) -> Option<ProcessId> {
-        let pid = ProcessId::new(self.next_pid);
-        self.next_pid += 1;
         for slot in self.processes.iter_mut() {
             if slot.is_none() {
-                *slot = Some(ProcessControlBlock::new(pid, entry_point, stack_addr));
+                let pid = ProcessId::new(self.next_pid);
+                *slot = Some(ProcessControlBlock::new(pid, entry_point, stack_addr)?);
+                self.next_pid += 1;
                 return Some(pid);
             }
         }

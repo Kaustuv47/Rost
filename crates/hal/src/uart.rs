@@ -52,6 +52,19 @@ pub fn print_str(s: &str) {
     }
 }
 
+pub fn print_dec(val: u64) {
+    if val == 0 { put_byte(b'0'); return; }
+    let mut buf = [0u8; 20];
+    let mut pos = 20usize;
+    let mut n = val;
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    for &b in &buf[pos..] { put_byte(b); }
+}
+
 pub fn print_hex(val: u64) {
     print_str("0x");
     let hex_chars = b"0123456789ABCDEF";
