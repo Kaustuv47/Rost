@@ -26,15 +26,25 @@ use core_kernel::process::pcb::TaskContext;
 /// Callee-saved registers and `rsp` are saved into `*old`; they are restored
 /// from `*new`, then execution resumes at the return address on the new stack.
 ///
+/// If `new_pml4 != 0` the PML4 table is loaded into CR3 after the stack switch,
+/// flushing the TLB and activating the new address space.  Pass `0` when both
+/// tasks share the same page table (e.g. while all processes are kernel-mode).
+///
 /// Interrupts are disabled for the duration of the switch and re-enabled by
 /// the `sti` executed just before `ret`.
 ///
 /// # Safety
-/// Both pointers must be valid, non-null, and point to correctly initialised
-/// `TaskContext` structs.  The stacks they reference must be valid kernel stacks.
+/// Both context pointers must be valid, non-null, and point to correctly
+/// initialised `TaskContext` structs.  The stacks they reference must be valid
+/// kernel stacks.  If `new_pml4 != 0` it must be a 4 KB-aligned physical
+/// address of a PML4 that identity-maps at least the currently executing code.
 #[unsafe(naked)]
-pub unsafe extern "C" fn switch_context(old: *mut TaskContext, new: *const TaskContext) {
-    // System V AMD64 ABI: rdi = old, rsi = new
+pub unsafe extern "C" fn switch_context(
+    old:      *mut TaskContext,
+    new:      *const TaskContext,
+    new_pml4: u64,
+) {
+    // System V AMD64 ABI: rdi = old, rsi = new, rdx = new_pml4
     core::arch::naked_asm!(
         "cli",                        // no interrupts during switch
 
@@ -49,6 +59,7 @@ pub unsafe extern "C" fn switch_context(old: *mut TaskContext, new: *const TaskC
         "mov  [rdi + 120], rsp",
 
         // ── Restore callee-saved registers and rsp from new context ──────────
+        // (rdx still holds new_pml4 — the restore does not touch it)
         "mov  rbx, [rsi +   0]",
         "mov  rbp, [rsi +   8]",
         "mov  r12, [rsi +  16]",
@@ -56,6 +67,13 @@ pub unsafe extern "C" fn switch_context(old: *mut TaskContext, new: *const TaskC
         "mov  r14, [rsi +  32]",
         "mov  r15, [rsi +  40]",
         "mov  rsp, [rsi + 120]",      // switch to new stack
+
+        // ── Conditionally switch address space ───────────────────────────────
+        // Skip CR3 write when new_pml4 == 0 (same address space).
+        "test rdx, rdx",
+        "jz   2f",
+        "mov  cr3, rdx",              // flush TLB + load new PML4
+        "2:",
 
         "sti",                        // re-enable interrupts
         "ret",                        // pop return address from new stack → jump

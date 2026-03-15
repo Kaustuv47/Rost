@@ -50,7 +50,12 @@ impl Shell {
                     self.handle_key(key);
                 }
             } else {
+                // No input — idle the CPU until the next interrupt fires.
+                // After hlt returns (timer IRQ), advance the scheduler.
+                // tick_scheduler() performs a context switch if a higher-
+                // priority process has become runnable or the quantum expired.
                 cpu::halt();
+                arch_x86_64::cpu::tick_scheduler();
             }
         }
     }

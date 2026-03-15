@@ -14,10 +14,18 @@ use super::physical::PhysicalAllocator;
 
 // ── Entry flags ───────────────────────────────────────────────────────────────
 
-pub const PTE_PRESENT:   u64 = 1 << 0;
-pub const PTE_WRITABLE:  u64 = 1 << 1;
-pub const PTE_USER:      u64 = 1 << 2;
-pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+pub const PTE_PRESENT:        u64 = 1 << 0;
+pub const PTE_WRITABLE:       u64 = 1 << 1;
+pub const PTE_USER:           u64 = 1 << 2;
+/// Page-Size bit in a PD entry — makes it a 2 MB huge-page leaf.
+pub const PTE_HUGE_PAGE:      u64 = 1 << 7;
+/// No-Execute bit (requires EFER.NXE = 1 to be active).
+pub const PTE_NO_EXECUTE:     u64 = 1u64 << 63;
+
+/// Physical-address mask for 4 KB page entries (PT / PDPT / PML4 entries).
+pub const PTE_ADDR_MASK:      u64 = 0x000F_FFFF_FFFF_F000;
+/// Physical-address mask for 2 MB huge-page PD entries (bits[51:21]).
+pub const PTE_HUGE_ADDR_MASK: u64 = 0x000F_FFFF_FFE0_0000;
 
 // ── Page table structure ──────────────────────────────────────────────────────
 
@@ -95,6 +103,50 @@ pub fn map_page(
     let flags = PTE_PRESENT | if writable { PTE_WRITABLE } else { 0 };
     unsafe { phys_to_table(pt_phys).entries[pt_idx] = (phys & PTE_ADDR_MASK) | flags; }
     true
+}
+
+/// Identity-map a physical region using 2 MB huge pages (PD-level).
+///
+/// Both `phys_base` and `size` are rounded to 2 MB boundaries before mapping.
+/// Each PD entry uses the PS (page-size) bit, so no PT allocations are needed:
+/// a 4 GB RAM system requires at most ~20 KB of page-table space.
+///
+/// `flags` must include `PTE_PRESENT`; add `PTE_WRITABLE`, `PTE_USER`, or
+/// `PTE_NO_EXECUTE` as needed.  `PTE_HUGE_PAGE` is set automatically.
+pub fn identity_map_region(
+    pml4:      &mut PageTable,
+    phys_base: u64,
+    size:      u64,
+    flags:     u64,
+    alloc:     &mut PhysicalAllocator,
+) {
+    const HUGE: u64 = 2 * 1024 * 1024; // 2 MB
+    let start = phys_base & !(HUGE - 1);                                // round down
+    let end   = (phys_base.saturating_add(size) + HUGE - 1) & !(HUGE - 1); // round up
+
+    let mut addr = start;
+    while addr < end {
+        let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
+        let pd_idx   = ((addr >> 21) & 0x1FF) as usize;
+
+        let pdpt_phys = match ensure_table(&mut pml4.entries[pml4_idx], alloc) {
+            Some(p) => p, None => return,
+        };
+        let pd_phys = unsafe {
+            match ensure_table(&mut phys_to_table(pdpt_phys).entries[pdpt_idx], alloc) {
+                Some(p) => p, None => return,
+            }
+        };
+
+        // Set the 2 MB huge-page PD entry only if not already mapped.
+        let entry = &mut unsafe { phys_to_table(pd_phys) }.entries[pd_idx];
+        if *entry & PTE_PRESENT == 0 {
+            *entry = (addr & PTE_HUGE_ADDR_MASK) | flags | PTE_HUGE_PAGE;
+        }
+
+        addr = addr.wrapping_add(HUGE);
+    }
 }
 
 /// Walk `pml4` to translate `virt` into its physical address.

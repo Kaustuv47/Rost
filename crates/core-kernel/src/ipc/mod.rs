@@ -1,3 +1,3 @@
 mod message;
 
-pub use message::{Message, MessageQueue};
+pub use message::{Message, MessageQueue, Notification};

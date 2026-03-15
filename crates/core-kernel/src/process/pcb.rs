@@ -87,6 +87,7 @@ impl TaskContext {
 pub struct ProcessControlBlock {
     pub pid:              ProcessId,
     pub state:            ProcessState,
+    /// Scheduling priority (0 = highest, 255 = lowest).  Default: 128.
     pub priority:         u8,
 
     // Saved CPU context (restored by `switch_context` on next run)
@@ -100,6 +101,25 @@ pub struct ProcessControlBlock {
     pub time_slice:       u32,   // ticks per quantum
     pub cpu_time:         u32,   // ticks consumed in current quantum
 
+    // ── Resource quotas ───────────────────────────────────────────────────────
+    /// Maximum physical pages this process may map.  0 = unlimited (kernel).
+    pub memory_quota_pages: u32,
+    /// Per-major-frame CPU budget in ticks (temporal partitioning).  0 = unlimited.
+    pub cpu_budget_ticks:   u32,
+    /// Budget consumed so far in the current frame.
+    pub cpu_budget_used:    u32,
+    /// IPC message rate limit — max messages per 100-tick window.  0 = unlimited.
+    pub ipc_rate_limit:     u16,
+    /// Messages sent in the current 100-tick window.
+    pub ipc_rate_used:      u16,
+
+    // ── Timing ────────────────────────────────────────────────────────────────
+    /// Total lifetime ticks this process has consumed (for `ps`/accounting).
+    pub total_cpu_ticks:    u64,
+    /// If `state == Blocked`, tick at which the process should be unblocked.
+    /// `u64::MAX` means no timeout.
+    pub blocked_deadline:   u64,
+
     // Per-process message mailbox
     pub mailbox:          crate::ipc::MessageQueue,
 }
@@ -107,7 +127,7 @@ pub struct ProcessControlBlock {
 impl ProcessControlBlock {
     /// Create a new PCB.  `entry_point` is where the process starts executing.
     /// `user_stack_top` is the initial RSP for the process's user/kernel context.
-    pub fn new(pid: ProcessId, entry_point: u64, _user_stack_top: u64) -> Option<Self> {
+    pub fn new(pid: ProcessId, entry_point: u64, _user_stack_top: u64, page_table_base: u64) -> Option<Self> {
         let (stack_id, kern_stack_top) = alloc_kernel_stack()?;
 
         // The kernel stack starts empty; rsp sits 8 bytes below the top so the
@@ -129,15 +149,22 @@ impl ProcessControlBlock {
 
         Some(ProcessControlBlock {
             pid,
-            state:           ProcessState::Ready,
-            priority:        10,
-            context:         ctx,
-            kernel_stack_id: stack_id,
-            kernel_rsp:      kern_rsp,
-            page_table_base: 0,
-            time_slice:      10,
-            cpu_time:        0,
-            mailbox:         crate::ipc::MessageQueue::new(),
+            state:              ProcessState::Ready,
+            priority:           128,
+            context:            ctx,
+            kernel_stack_id:    stack_id,
+            kernel_rsp:         kern_rsp,
+            page_table_base,
+            time_slice:         10,
+            cpu_time:           0,
+            memory_quota_pages: 0,
+            cpu_budget_ticks:   0,
+            cpu_budget_used:    0,
+            ipc_rate_limit:     0,
+            ipc_rate_used:      0,
+            total_cpu_ticks:    0,
+            blocked_deadline:   u64::MAX,
+            mailbox:            crate::ipc::MessageQueue::new(),
         })
     }
 }
