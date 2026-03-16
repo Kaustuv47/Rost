@@ -1,22 +1,13 @@
-//! Rost VFS Server — virtual filesystem for the Rost microkernel.
+//! Rost VFS Server — virtual filesystem IPC server.
 //!
-//! Runs as a ring-3 ELF binary (PID 3 by convention).
-//! All storage access goes through the IPC protocol defined in proto.rs.
-//! Currently backed by a static RAM disk (fs.rs).  A real block driver
-//! (servers/block-drv) would replace the RAM disk once the ELF loader exists.
+//! Runs as a ring-3 ELF binary, PID 3 by convention.
+//! Backed by a static in-memory directory tree (fs.rs).
 //!
-//! # IPC protocol summary
-//!
-//! Client sends OP_LIST or OP_READ; VFS replies with RESP_ENTRY/RESP_DATA
-//! messages followed by RESP_DONE, or RESP_ERROR on failure.
-//! See proto.rs for the full wire format.
-//!
-//! # Build
-//! ```sh
-//! cd servers
-//! cargo build --target x86_64-unknown-none
-//! # produces: target/x86_64-unknown-none/debug/rost-vfs
-//! ```
+//! # Supported operations
+//! - OP_READDIR / OP_LIST  — list directory entries
+//! - OP_READ               — read file data (chunked, stateless)
+//! - OP_STAT               — query path metadata
+//! - OP_MOUNT              — query mount table
 #![no_std]
 #![no_main]
 
@@ -27,107 +18,166 @@ mod syscall;
 use proto::*;
 use syscall::{Msg, recv_msg, send_msg};
 
-/// Magic constant recognised by init as EVENT_VFS_READY.
-const EVENT_VFS_READY: u64 = 0x5246_5342_5f52_4459; // "RFSB_RDY"
+/// Mount table — one entry per filesystem root.
+struct MountPoint {
+    path:   &'static [u8],
+    fstype: &'static [u8],
+    source: &'static [u8],
+}
+
+static MOUNTS: &[MountPoint] = &[
+    MountPoint { path: b"/",    fstype: b"ramfs",  source: b"ramdisk:0" },
+    // Future entries once block-drv + FAT32 parser are implemented:
+    // MountPoint { path: b"/dev",  fstype: b"devfs",  source: b"virtual" },
+    // MountPoint { path: b"/proc", fstype: b"procfs", source: b"virtual" },
+];
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // Signal init (PID 1) that we are alive and ready for IPC.
-    syscall::notify(1, EVENT_VFS_READY);
-
+    // Signal init (PID 1) that the VFS is ready.
+    syscall::notify(1, 0x5246_5342_5f52_4459); // "RFSB_RDY"
     dispatch_loop()
 }
 
 fn dispatch_loop() -> ! {
     loop {
         let mut req = Msg::zeroed();
-        // Block indefinitely until a client sends a request.
-        if !recv_msg(u64::MAX, &mut req) {
-            continue;
-        }
+        if !recv_msg(u64::MAX, &mut req) { continue; }
 
-        let requester = req.sender;
+        let from = req.sender;
 
         match req.data[0] {
-            OP_LIST => handle_list(requester),
-            OP_READ => handle_read(
-                requester,
-                req.data[1],        // byte_offset
-                req.data[2],        // name word 0
-                req.data[3],        // name word 1
-            ),
+            OP_READDIR => {
+                let path = unpack_path(&req.data[2..8]);
+                handle_readdir(from, &path);
+            }
+            OP_READ => {
+                let offset = req.data[1];
+                let path   = unpack_path(&req.data[2..8]);
+                handle_read(from, offset, &path);
+            }
+            OP_STAT => {
+                let path = unpack_path(&req.data[2..8]);
+                handle_stat(from, &path);
+            }
+            OP_MOUNT => handle_mount(from),
             _ => {
-                // Unknown opcode — send RESP_ERROR back.
-                let mut resp = Msg::zeroed();
-                resp.data[0] = RESP_ERROR;
-                resp.data[1] = 2; // ENOSYS
-                send_msg(requester as u64, &resp);
+                let mut r = Msg::zeroed();
+                r.data[0] = RESP_ERROR;
+                r.data[1] = ENOSYS;
+                send_msg(from as u64, &r);
             }
         }
     }
 }
 
-// ── OP_LIST handler ───────────────────────────────────────────────────────────
+// ── OP_READDIR ────────────────────────────────────────────────────────────────
 
-fn handle_list(requester: u32) {
-    for entry in fs::FILES {
-        let mut resp = Msg::zeroed();
-        resp.data[0] = RESP_ENTRY;
-        resp.data[1] = entry.flags as u64;
-        resp.data[2] = entry.data.len() as u64;
-        // Pack filename (up to 40 bytes) into data[3..7].
-        pack_name_into(&mut resp.data[3..8], entry.name);
-        send_msg(requester as u64, &resp);
-    }
-    // Send end-of-listing sentinel.
-    let mut done = Msg::zeroed();
-    done.data[0] = RESP_DONE;
-    send_msg(requester as u64, &done);
-}
+fn handle_readdir(from: u32, path: &[u8]) {
+    // Empty path or "/" → list root.
+    let target_path = if fs::trim_null(path).is_empty() { b"/" as &[u8] } else { path };
 
-// ── OP_READ handler ───────────────────────────────────────────────────────────
-
-fn handle_read(requester: u32, byte_offset: u64, name_w0: u64, name_w1: u64) {
-    // Reconstruct filename from the two packed words (up to 16 bytes).
-    let name_buf = unpack_name(name_w0, name_w1);
-
-    let entry = match fs::find(&name_buf) {
-        Some(e) => e,
+    let node = match fs::lookup(target_path) {
+        Some(n) => n,
         None => {
-            let mut resp = Msg::zeroed();
-            resp.data[0] = RESP_ERROR;
-            resp.data[1] = 1; // ENOENT
-            send_msg(requester as u64, &resp);
+            send_error(from, ENOENT);
             return;
         }
     };
 
-    let total = entry.data.len();
-    let offset = byte_offset as usize;
+    match &node.kind {
+        fs::NodeType::File { .. } => {
+            send_error(from, ENOTDIR);
+        }
+        fs::NodeType::Dir { children } => {
+            for entry in *children {
+                let mut r = Msg::zeroed();
+                r.data[0] = RESP_ENTRY;
+                r.data[1] = entry.node.flags();
+                r.data[2] = entry.node.size();
+                pack_bytes_into(&mut r.data[3..8], entry.name);
+                send_msg(from as u64, &r);
+            }
+            send_done(from);
+        }
+    }
+}
 
-    if offset >= total {
-        // Past end of file — signal completion.
-        let mut resp = Msg::zeroed();
-        resp.data[0] = RESP_DONE;
-        send_msg(requester as u64, &resp);
+// ── OP_READ ───────────────────────────────────────────────────────────────────
+
+fn handle_read(from: u32, offset: u64, path: &[u8]) {
+    let node = match fs::lookup(path) {
+        Some(n) => n,
+        None => { send_error(from, ENOENT); return; }
+    };
+
+    let data = match &node.kind {
+        fs::NodeType::File { data, .. } => *data,
+        fs::NodeType::Dir  { .. }       => { send_error(from, EISDIR); return; }
+    };
+
+    let off = offset as usize;
+    if off >= data.len() {
+        send_done(from);
         return;
     }
 
-    let end   = core::cmp::min(offset + CHUNK_SIZE, total);
-    let chunk = &entry.data[offset..end];
+    let end   = core::cmp::min(off + CHUNK_SIZE, data.len());
+    let chunk = &data[off..end];
 
-    let mut resp = Msg::zeroed();
-    resp.data[0] = RESP_DATA;
-    resp.data[1] = total as u64;
-    resp.data[2] = chunk.len() as u64;
-    // Pack chunk bytes into data[3..7] (up to 40 bytes).
-    pack_bytes_into(&mut resp.data[3..8], chunk);
-    send_msg(requester as u64, &resp);
+    let mut r = Msg::zeroed();
+    r.data[0] = RESP_DATA;
+    r.data[1] = data.len() as u64;
+    r.data[2] = chunk.len() as u64;
+    pack_bytes_into(&mut r.data[3..8], chunk);
+    send_msg(from as u64, &r);
 }
 
-// ── Packing helpers ───────────────────────────────────────────────────────────
+// ── OP_STAT ───────────────────────────────────────────────────────────────────
 
-/// Pack `src` bytes (up to `words.len() * 8`) little-endian into `words`.
+fn handle_stat(from: u32, path: &[u8]) {
+    match fs::lookup(path) {
+        None => send_error(from, ENOENT),
+        Some(node) => {
+            let mut r = Msg::zeroed();
+            r.data[0] = RESP_STAT;
+            r.data[1] = node.flags();
+            r.data[2] = node.size();
+            send_msg(from as u64, &r);
+        }
+    }
+}
+
+// ── OP_MOUNT ──────────────────────────────────────────────────────────────────
+
+fn handle_mount(from: u32) {
+    for m in MOUNTS {
+        let mut r = Msg::zeroed();
+        r.data[0] = RESP_MOUNT;
+        r.data[1] = 0;
+        pack_bytes_into(&mut r.data[2..6], m.path);   // 32-byte mount path
+        pack_bytes_into(&mut r.data[6..8], m.fstype); // 16-byte fs type
+        send_msg(from as u64, &r);
+    }
+    send_done(from);
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn send_done(to: u32) {
+    let mut r = Msg::zeroed();
+    r.data[0] = RESP_DONE;
+    send_msg(to as u64, &r);
+}
+
+fn send_error(to: u32, errno: u64) {
+    let mut r = Msg::zeroed();
+    r.data[0] = RESP_ERROR;
+    r.data[1] = errno;
+    send_msg(to as u64, &r);
+}
+
+/// Pack `src` bytes little-endian into `words` (each word holds 8 bytes).
 fn pack_bytes_into(words: &mut [u64], src: &[u8]) {
     for (i, &b) in src.iter().enumerate() {
         let wi = i / 8;
@@ -138,24 +188,21 @@ fn pack_bytes_into(words: &mut [u64], src: &[u8]) {
     }
 }
 
-/// Pack a filename (null-terminated, up to `words.len() * 8` bytes) into words.
-fn pack_name_into(words: &mut [u64], name: &[u8]) {
-    pack_bytes_into(words, name);
-    // The name is naturally null-terminated because Msg::zeroed() starts at 0.
-}
-
-/// Reconstruct a 16-byte name buffer from two u64 words (little-endian bytes).
-fn unpack_name(w0: u64, w1: u64) -> [u8; 16] {
-    let mut buf = [0u8; 16];
-    for i in 0..8 { buf[i]   = (w0 >> (i * 8)) as u8; }
-    for i in 0..8 { buf[8+i] = (w1 >> (i * 8)) as u8; }
+/// Reconstruct a 48-byte path buffer from 6 little-endian-packed u64 words.
+fn unpack_path(words: &[u64]) -> [u8; 48] {
+    let mut buf = [0u8; 48];
+    for (wi, &w) in words.iter().enumerate().take(6) {
+        for bi in 0..8 {
+            buf[wi * 8 + bi] = (w >> (bi * 8)) as u8;
+        }
+    }
     buf
 }
 
-// ── Panic handler ─────────────────────────────────────────────────────────────
+// ── Panic ─────────────────────────────────────────────────────────────────────
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(_: &core::panic::PanicInfo) -> ! {
     syscall::notify(1, 0x5246_5342_5f45_5252); // "RFSB_ERR"
     syscall::exit(1);
 }

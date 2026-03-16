@@ -5,27 +5,29 @@ use super::history::History;
 
 // ── VFS IPC constants ─────────────────────────────────────────────────────────
 
-/// Well-known PID for the VFS server (init=1, uart-drv=2, vfs=3).
-const VFS_PID: u64 = 3;
+const VFS_PID:    u64 = 3;
+const VFS_TIMEOUT: u64 = 100; // ticks (~1 s at 100 Hz)
 
-// Opcodes sent to VFS
-const OP_LIST: u64 = 0x20;
-const OP_READ: u64 = 0x22;
+// Opcodes  (must match servers/vfs/src/proto.rs)
+const OP_READDIR: u64 = 0x20;
+const OP_READ:    u64 = 0x22;
+const OP_STAT:    u64 = 0x23;
+const OP_MOUNT:   u64 = 0x24;
 
-// Responses from VFS
-const RESP_ENTRY: u64 = 0x80; // one directory entry (ls)
-const RESP_DONE:  u64 = 0x81; // end of list / end of read
-const RESP_DATA:  u64 = 0x82; // file data chunk (cat)
-const RESP_ERROR: u64 = 0x8F; // error (word1=1 means not found)
-
-/// Ticks to wait for a VFS response before declaring timeout (100 Hz → ~1 s).
-const VFS_TIMEOUT: u64 = 100;
+// Responses
+const RESP_ENTRY: u64 = 0x80;
+const RESP_DONE:  u64 = 0x81;
+const RESP_DATA:  u64 = 0x82;
+const RESP_STAT:  u64 = 0x83;
+const RESP_MOUNT: u64 = 0x84;
+const RESP_ERROR: u64 = 0x8F;
 
 // ── Command registry ─────────────────────────────────────────────────────────
 
-/// All built-in command names, sorted for binary-search tab completion.
+/// All built-in command names — must stay sorted (binary-search completion).
 const COMMANDS: &[&[u8]] = &[
     b"cat",
+    b"cd",
     b"clear",
     b"echo",
     b"exec",
@@ -36,13 +38,17 @@ const COMMANDS: &[&[u8]] = &[
     b"kill",
     b"ls",
     b"mem",
+    b"mount",
     b"ps",
+    b"pwd",
     b"uptime",
 ];
 
 pub enum Action {
     Continue,
-    Exit(u64),  // exit code
+    Exit(u64),
+    /// Shell should update its cwd to the given path (len bytes of buf).
+    Cd([u8; 64], usize),
 }
 
 // ── Tokenizer ─────────────────────────────────────────────────────────────────
@@ -60,8 +66,6 @@ impl<'a> Args<'a> {
     }
 }
 
-/// Split `line` into whitespace-separated tokens.
-/// Double-quoted tokens may contain spaces; the quotes are stripped.
 fn tokenize(line: &[u8]) -> Args<'_> {
     let mut args = Args { items: [b""; MAX_ARGS], count: 0 };
     let mut i = 0;
@@ -84,45 +88,47 @@ fn tokenize(line: &[u8]) -> Args<'_> {
             args.count += 1;
         }
     }
-
     args
 }
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
-pub fn dispatch(line: &[u8], history: &History) -> Action {
+/// `cwd` is the shell's current working directory (e.g. b"/home/user").
+pub fn dispatch(line: &[u8], history: &History, cwd: &[u8]) -> Action {
     let args = tokenize(line);
-    let cmd = args.get(0);
+    let cmd  = args.get(0);
     if cmd.is_empty() { return Action::Continue; }
 
     match cmd {
-        b"cat"     => cmd_cat(&args),
-        b"clear"   => cmd_clear(),
-        b"echo"    => cmd_echo(&args),
-        b"exec"    => cmd_exec(&args),
+        b"cat"     => cmd_cat(&args, cwd),
+        b"cd"      => cmd_cd(&args, cwd),
+        b"clear"   => { cmd_clear(); Action::Continue }
+        b"echo"    => { cmd_echo(&args); Action::Continue }
+        b"exec"    => { cmd_exec(&args); Action::Continue }
         b"exit"    => {
             let code = parse_u64(args.get(1));
-            return Action::Exit(code);
+            Action::Exit(code)
         }
         b"halt"    => {
             serial::print_str("System halting...\n");
-            return Action::Exit(0);
+            Action::Exit(0)
         }
-        b"help"    => cmd_help(),
-        b"history" => cmd_history(history),
-        b"kill"    => cmd_kill(&args),
-        b"ls"      => cmd_ls(),
-        b"mem"     => cmd_mem(),
-        b"ps"      => cmd_ps(),
-        b"uptime"  => cmd_uptime(),
+        b"help"    => { cmd_help(); Action::Continue }
+        b"history" => { cmd_history(history); Action::Continue }
+        b"kill"    => { cmd_kill(&args); Action::Continue }
+        b"ls"      => { cmd_ls(&args, cwd); Action::Continue }
+        b"mem"     => { cmd_mem(); Action::Continue }
+        b"mount"   => { cmd_mount(); Action::Continue }
+        b"ps"      => { cmd_ps(); Action::Continue }
+        b"pwd"     => { cmd_pwd(cwd); Action::Continue }
+        b"uptime"  => { cmd_uptime(); Action::Continue }
         _ => {
             serial::print_str("rost: command not found: ");
             for &b in cmd { serial::put_byte(b); }
             serial::put_byte(b'\n');
+            Action::Continue
         }
     }
-
-    Action::Continue
 }
 
 // ── Tab completion ────────────────────────────────────────────────────────────
@@ -157,7 +163,6 @@ pub fn try_complete(editor: &mut LineEditor) -> usize {
             serial::put_byte(b'\n');
         }
     }
-
     count
 }
 
@@ -173,7 +178,8 @@ fn cmd_echo(args: &Args<'_>) {
 
 fn cmd_help() {
     serial::print_str("Built-in commands:\n");
-    serial::print_str("  cat <file>         print file contents from VFS\n");
+    serial::print_str("  cat <path>         print file contents\n");
+    serial::print_str("  cd [path]          change directory  (default: /)\n");
     serial::print_str("  clear              clear the screen\n");
     serial::print_str("  echo <args...>     print arguments\n");
     serial::print_str("  exec <path>        load and run an ELF binary  [needs ELF loader]\n");
@@ -181,19 +187,20 @@ fn cmd_help() {
     serial::print_str("  halt               halt the system\n");
     serial::print_str("  help               show this message\n");
     serial::print_str("  history            list command history\n");
-    serial::print_str("  kill <pid>         send SIGTERM notification to a process\n");
-    serial::print_str("  ls                 list files in VFS\n");
-    serial::print_str("  mem                show memory usage             [needs kernel API]\n");
-    serial::print_str("  ps                 list running processes        [needs kernel API]\n");
-    serial::print_str("  uptime             show system tick count        [needs kernel API]\n");
+    serial::print_str("  kill <pid>         send SIGTERM to a process\n");
+    serial::print_str("  ls [path]          list directory  (default: cwd)\n");
+    serial::print_str("  mem                show memory info  [needs kernel API]\n");
+    serial::print_str("  mount              show filesystem mount table\n");
+    serial::print_str("  ps                 list processes  [needs kernel API]\n");
+    serial::print_str("  pwd                print working directory\n");
+    serial::print_str("  uptime             show tick count  [needs kernel API]\n");
     serial::print_str("\nLine editing:\n");
-    serial::print_str("  Left / Right       move cursor\n");
-    serial::print_str("  Home / End         jump to start or end of line\n");
-    serial::print_str("  Backspace / Del    delete character\n");
-    serial::print_str("  Up / Down          browse history\n");
-    serial::print_str("  Tab                complete command name\n");
-    serial::print_str("  Ctrl+C             cancel current line\n");
-    serial::print_str("  Ctrl+L             clear screen\n");
+    serial::print_str("  Left/Right  Home/End   move cursor\n");
+    serial::print_str("  Up/Down                browse history\n");
+    serial::print_str("  Tab                    complete command name\n");
+    serial::print_str("  Backspace / Del        delete character\n");
+    serial::print_str("  Ctrl+C                 cancel line\n");
+    serial::print_str("  Ctrl+L                 clear screen\n");
 }
 
 fn cmd_clear() {
@@ -217,12 +224,24 @@ fn cmd_history(history: &History) {
     }
 }
 
-/// `ls` — list files in the VFS RAM disk.
-fn cmd_ls() {
+// ── VFS commands ──────────────────────────────────────────────────────────────
+
+/// `ls [path]` — list directory contents via VFS OP_READDIR.
+fn cmd_ls(args: &Args<'_>, cwd: &[u8]) {
+    let raw = args.get(1);
+    let (target, _) = if raw.is_empty() {
+        path_as_words(cwd)
+    } else {
+        let (buf, len) = resolve(cwd, raw);
+        path_as_words(&buf[..len])
+    };
+
     let mut req = Msg::zeroed();
-    req.data[0] = OP_LIST;
+    req.data[0] = OP_READDIR;
+    req.data[2..8].copy_from_slice(&target);
+
     if !send_msg(VFS_PID, &req) {
-        serial::print_str("ls: failed to reach VFS\n");
+        serial::print_str("ls: failed to reach VFS (PID 3)\n");
         return;
     }
 
@@ -234,38 +253,49 @@ fn cmd_ls() {
             return;
         }
         match resp.data[0] {
-            RESP_DONE => break,
+            RESP_DONE  => break,
             RESP_ENTRY => {
                 found = true;
                 let flags = resp.data[1];
                 let size  = resp.data[2];
-                // name packed into data[3..7] (40 bytes, null-terminated)
+                let is_dir = flags & 1 != 0;
+                let is_exe = flags & 2 != 0;
+                // Colour: bold-blue for dirs, bold-green for executables, white for files.
+                if is_dir       { serial::print_str("\x1b[1;34m"); }
+                else if is_exe  { serial::print_str("\x1b[1;32m"); }
                 print_packed_name(&resp.data[3..8]);
-                if flags & 1 != 0 { serial::put_byte(b'*'); } // executable marker
-                serial::print_str("\t");
-                print_u64(size);
+                if is_dir { serial::put_byte(b'/'); }
+                serial::print_str("\x1b[0m\t");
+                if is_dir { serial::print_str("dir"); }
+                else      { print_u64(size); serial::print_str(" B"); }
                 serial::put_byte(b'\n');
             }
-            _ => {
-                serial::print_str("ls: unexpected response from VFS\n");
+            RESP_ERROR => {
+                let errno = resp.data[1];
+                serial::print_str("ls: ");
+                match errno {
+                    2 => serial::print_str("not a directory\n"),
+                    1 => serial::print_str("no such file or directory\n"),
+                    _ => serial::print_str("error\n"),
+                }
                 return;
             }
+            _ => { serial::print_str("ls: unexpected VFS response\n"); return; }
         }
     }
-    if !found {
-        serial::print_str("(empty)\n");
-    }
+    if !found { serial::print_str("(empty)\n"); }
 }
 
-/// `cat <file>` — print the contents of a file from the VFS.
-fn cmd_cat(args: &Args<'_>) {
-    let path = args.get(1);
-    if path.is_empty() {
-        serial::print_str("usage: cat <file>\n");
-        return;
+/// `cat <path>` — stream file contents via VFS OP_READ.
+fn cmd_cat(args: &Args<'_>, cwd: &[u8]) -> Action {
+    let raw = args.get(1);
+    if raw.is_empty() {
+        serial::print_str("usage: cat <path>\n");
+        return Action::Continue;
     }
+    let (res_buf, res_len) = resolve(cwd, raw);
+    let (pw, _)  = path_as_words(&res_buf[..res_len]);
 
-    let (nw0, nw1) = pack_name(path);
     let mut offset: u64 = 0;
     let mut total:  u64 = u64::MAX;
 
@@ -273,71 +303,120 @@ fn cmd_cat(args: &Args<'_>) {
         let mut req = Msg::zeroed();
         req.data[0] = OP_READ;
         req.data[1] = offset;
-        req.data[2] = nw0;
-        req.data[3] = nw1;
+        req.data[2..8].copy_from_slice(&pw);
+
         if !send_msg(VFS_PID, &req) {
             serial::print_str("cat: failed to reach VFS\n");
-            return;
+            return Action::Continue;
         }
 
         let mut resp = Msg::zeroed();
         if !recv_msg(VFS_TIMEOUT, &mut resp) {
             serial::print_str("cat: VFS timeout\n");
-            return;
+            return Action::Continue;
         }
 
         match resp.data[0] {
             RESP_DATA => {
                 if total == u64::MAX { total = resp.data[1]; }
-                let chunk_len = resp.data[2] as usize;
-                if chunk_len == 0 { break; }
-                // data packed into data[3..7] (up to 40 bytes)
-                print_packed_bytes(&resp.data[3..8], chunk_len);
-                offset += chunk_len as u64;
+                let chunk = resp.data[2] as usize;
+                if chunk == 0 { break; }
+                print_packed_bytes(&resp.data[3..8], chunk);
+                offset += chunk as u64;
                 if offset >= total { break; }
             }
-            RESP_DONE => break,
+            RESP_DONE  => break,
             RESP_ERROR => {
+                let errno = resp.data[1];
                 serial::print_str("cat: ");
-                for &b in path { serial::put_byte(b); }
-                serial::print_str(": no such file\n");
-                return;
+                for &b in raw { serial::put_byte(b); }
+                match errno {
+                    1 => serial::print_str(": no such file or directory\n"),
+                    3 => serial::print_str(": is a directory\n"),
+                    _ => serial::print_str(": error\n"),
+                }
+                return Action::Continue;
             }
-            _ => {
-                serial::print_str("cat: unexpected response from VFS\n");
-                return;
+            _ => { serial::print_str("cat: unexpected VFS response\n"); return Action::Continue; }
+        }
+    }
+    Action::Continue
+}
+
+/// `cd [path]` — change current directory (no VFS round-trip; validated lazily).
+fn cmd_cd(args: &Args<'_>, cwd: &[u8]) -> Action {
+    let raw = args.get(1);
+    let new = if raw.is_empty() {
+        // cd with no args → go to root.
+        let mut buf = [0u8; 64];
+        buf[0] = b'/';
+        (buf, 1usize)
+    } else {
+        resolve(cwd, raw)
+    };
+    Action::Cd(new.0, new.1)
+}
+
+/// `pwd` — print the current working directory.
+fn cmd_pwd(cwd: &[u8]) {
+    let len = cwd.iter().position(|&b| b == 0).unwrap_or(cwd.len());
+    for &b in &cwd[..len] { serial::put_byte(b); }
+    serial::put_byte(b'\n');
+}
+
+/// `mount` — show the filesystem mount table.
+fn cmd_mount() {
+    let mut req = Msg::zeroed();
+    req.data[0] = OP_MOUNT;
+    if !send_msg(VFS_PID, &req) {
+        serial::print_str("mount: failed to reach VFS\n");
+        return;
+    }
+
+    serial::print_str("MOUNT POINT              TYPE     SOURCE\n");
+    serial::print_str("------------------------ -------- ------------------\n");
+
+    loop {
+        let mut resp = Msg::zeroed();
+        if !recv_msg(VFS_TIMEOUT, &mut resp) {
+            serial::print_str("mount: VFS timeout\n");
+            return;
+        }
+        match resp.data[0] {
+            RESP_DONE  => break,
+            RESP_MOUNT => {
+                // path in data[2..6] (32 bytes), fstype in data[6..8] (16 bytes)
+                print_packed_name(&resp.data[2..6]);
+                serial::print_str("\t ");
+                print_packed_name(&resp.data[6..8]);
+                serial::put_byte(b'\n');
             }
+            _ => { serial::print_str("mount: unexpected VFS response\n"); return; }
         }
     }
 }
 
-/// `exec <path>` — load and run an ELF binary from the VFS.
-/// Requires: VFS server + ELF loader.
+/// `exec <path>` — load and run an ELF binary.
 fn cmd_exec(args: &Args<'_>) {
     let path = args.get(1);
     if path.is_empty() {
         serial::print_str("usage: exec <path>\n");
         return;
     }
-    // TODO: SYS_SEND(VFS_PID, OP_EXEC, path_ptr, path_len)
-    // The VFS server opens the file, the ELF loader maps it,
-    // and the kernel creates a new process with the entry point.
-    serial::print_str("exec: VFS not yet implemented — cannot load ");
+    serial::print_str("exec: ELF loader not yet implemented — cannot run ");
     for &b in path { serial::put_byte(b); }
     serial::put_byte(b'\n');
 }
 
-/// `kill <pid>` — send a termination notification to a process.
+/// `kill <pid>` — send SIGTERM to a process.
 fn cmd_kill(args: &Args<'_>) {
     let pid_bytes = args.get(1);
     if pid_bytes.is_empty() {
         serial::print_str("usage: kill <pid>\n");
         return;
     }
-    let pid = parse_u64(pid_bytes);
-    // SYS_NOTIFY(pid, SIGTERM_WORD) — receiver checks pending_notification
-    // and calls SYS_EXIT if it sees the SIGTERM bit.
-    let result = crate::syscall::notify(pid, 0x0000_0001); // bit 0 = SIGTERM
+    let pid    = parse_u64(pid_bytes);
+    let result = crate::syscall::notify(pid, 0x0000_0001);
     if result == 0 {
         serial::print_str("kill: signal sent to PID ");
         print_u64(pid);
@@ -347,43 +426,97 @@ fn cmd_kill(args: &Args<'_>) {
     }
 }
 
-/// `ps` — list processes.
-/// TODO: needs a sys_ps syscall or a process info IPC endpoint.
 fn cmd_ps() {
     serial::print_str("ps: process list not yet available\n");
-    serial::print_str("    (requires kernel IPC endpoint for process info)\n");
     serial::print_str("    own PID: ");
     print_u64(crate::syscall::getpid() as u64);
     serial::put_byte(b'\n');
 }
 
-/// `mem` — show memory usage.
-/// TODO: needs a sys_meminfo syscall or a memory info IPC endpoint.
 fn cmd_mem() {
-    serial::print_str("mem: memory info not yet available\n");
-    serial::print_str("    (requires kernel IPC endpoint for allocator state)\n");
+    serial::print_str("mem: memory info not yet available (needs kernel IPC)\n");
 }
 
-/// `uptime` — show TICK_COUNT.
-/// TODO: needs sys_clock_gettime or an uptime IPC endpoint.
 fn cmd_uptime() {
-    serial::print_str("uptime: clock API not yet available\n");
-    serial::print_str("       (requires sys_clock_gettime syscall)\n");
+    serial::print_str("uptime: clock API not yet available (needs SYS_CLOCK_GETTIME)\n");
 }
 
-// ── VFS name packing helpers ──────────────────────────────────────────────────
+// ── Path helpers ──────────────────────────────────────────────────────────────
 
-/// Pack up to 16 bytes of a filename into two u64 words (little-endian bytes).
-/// Matches `unpack_name` in the VFS server.
-fn pack_name(name: &[u8]) -> (u64, u64) {
-    let mut w0 = 0u64;
-    let mut w1 = 0u64;
-    for (i, &b) in name.iter().enumerate().take(8)  { w0 |= (b as u64) << (i * 8); }
-    for (i, &b) in name.iter().skip(8).enumerate().take(8) { w1 |= (b as u64) << (i * 8); }
-    (w0, w1)
+/// Resolve `input` relative to `cwd`.
+/// Returns a (buf, len) pair where buf[..len] is the absolute path.
+fn resolve(cwd: &[u8], input: &[u8]) -> ([u8; 64], usize) {
+    let cwd_len = cwd.iter().position(|&b| b == 0).unwrap_or(cwd.len());
+    let cwd     = &cwd[..cwd_len];
+
+    // Absolute path: use as-is.
+    if input.starts_with(b"/") {
+        let mut buf = [0u8; 64];
+        let len = input.len().min(63);
+        buf[..len].copy_from_slice(&input[..len]);
+        // Remove trailing slash unless it's the root itself.
+        let len = if len > 1 && buf[len - 1] == b'/' { len - 1 } else { len };
+        return (buf, len);
+    }
+
+    // Parent directory.
+    if input == b".." {
+        let mut buf = [0u8; 64];
+        let new_len = parent_of(cwd);
+        buf[..new_len].copy_from_slice(&cwd[..new_len]);
+        return (buf, new_len);
+    }
+
+    // Current directory.
+    if input == b"." {
+        let mut buf = [0u8; 64];
+        buf[..cwd_len].copy_from_slice(cwd);
+        return (buf, cwd_len);
+    }
+
+    // Relative path: append to cwd.
+    let mut buf = [0u8; 64];
+    let mut len = cwd_len.min(63);
+    buf[..len].copy_from_slice(&cwd[..len]);
+    // Insert separator.
+    if len > 0 && buf[len - 1] != b'/' && len < 63 {
+        buf[len] = b'/';
+        len += 1;
+    }
+    for &b in input.iter().take(63 - len) {
+        buf[len] = b;
+        len += 1;
+    }
+    (buf, len)
 }
 
-/// Print a null-terminated name packed as little-endian bytes in `words`.
+/// Return the length of the parent directory portion of `path`
+/// (i.e., strip the last component).  Always returns at least 1 (the root `/`).
+fn parent_of(path: &[u8]) -> usize {
+    let stripped = if path.last() == Some(&b'/') && path.len() > 1 {
+        &path[..path.len() - 1]
+    } else {
+        path
+    };
+    match stripped.iter().rposition(|&b| b == b'/') {
+        Some(0) | None => 1,    // parent is root
+        Some(pos)      => pos,
+    }
+}
+
+/// Pack path bytes (up to 48 bytes = 6 words) as little-endian u64 words.
+/// Returns (words[6], actual_len_capped).
+fn path_as_words(path: &[u8]) -> ([u64; 6], usize) {
+    let len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    let path = &path[..len];
+    let mut words = [0u64; 6];
+    for (i, &b) in path.iter().enumerate().take(48) {
+        words[i / 8] |= (b as u64) << ((i % 8) * 8);
+    }
+    (words, len)
+}
+
+/// Print a null-terminated name from little-endian packed words.
 fn print_packed_name(words: &[u64]) {
     'outer: for &w in words {
         for i in 0..8 {
@@ -394,29 +527,25 @@ fn print_packed_name(words: &[u64]) {
     }
 }
 
-/// Print `byte_count` bytes packed little-endian in `words`.
+/// Print `byte_count` bytes from little-endian packed words.
 fn print_packed_bytes(words: &[u64], byte_count: usize) {
-    let mut remaining = byte_count;
+    let mut left = byte_count;
     'outer: for &w in words {
         for i in 0..8 {
-            if remaining == 0 { break 'outer; }
+            if left == 0 { break 'outer; }
             serial::put_byte((w >> (i * 8)) as u8);
-            remaining -= 1;
+            left -= 1;
         }
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Number helpers ────────────────────────────────────────────────────────────
 
 pub fn print_usize(mut n: usize) {
     if n == 0 { serial::put_byte(b'0'); return; }
     let mut buf = [0u8; 20];
     let mut pos = 20usize;
-    while n > 0 {
-        pos -= 1;
-        buf[pos] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
+    while n > 0 { pos -= 1; buf[pos] = b'0' + (n % 10) as u8; n /= 10; }
     for &b in &buf[pos..] { serial::put_byte(b); }
 }
 
@@ -424,11 +553,7 @@ fn print_u64(mut n: u64) {
     if n == 0 { serial::put_byte(b'0'); return; }
     let mut buf = [0u8; 20];
     let mut pos = 20usize;
-    while n > 0 {
-        pos -= 1;
-        buf[pos] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
+    while n > 0 { pos -= 1; buf[pos] = b'0' + (n % 10) as u8; n /= 10; }
     for &b in &buf[pos..] { serial::put_byte(b); }
 }
 
@@ -437,9 +562,7 @@ fn parse_u64(s: &[u8]) -> u64 {
     for &b in s {
         if b >= b'0' && b <= b'9' {
             n = n.saturating_mul(10).saturating_add((b - b'0') as u64);
-        } else {
-            break;
-        }
+        } else { break; }
     }
     n
 }

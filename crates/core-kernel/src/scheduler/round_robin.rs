@@ -185,6 +185,9 @@ impl Scheduler {
     ///   1. Calling `set_rsp0(new_kernel_rsp)` to update TSS.RSP0.
     ///   2. Calling `switch_context(old_ctx, new_ctx, new_pml4)` to perform the switch.
     pub fn timer_tick(&self) -> Option<(*mut TaskContext, *const TaskContext, u64, u64)> {
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+
         let current_tick = {
             let mut t = self.tick.borrow_mut();
             *t += 1;
