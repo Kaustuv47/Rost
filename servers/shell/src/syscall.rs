@@ -1,29 +1,42 @@
 //! Raw syscall wrappers.
 //!
-//! Calling convention — mirrors Linux x86_64 / Rost `dispatch_syscall`:
-//!
-//! | Register | Role |
-//! |----------|------|
-//! | rax | syscall number (in) / return value (out) |
-//! | rdi | arg 0 |
-//! | rsi | arg 1 |
-//! | rdx | arg 2 |
-//! | rcx | saved user RIP (clobbered by SYSCALL instruction) |
-//! | r11 | saved user RFLAGS (clobbered by SYSCALL instruction) |
-//!
 //! Syscall table (must match arch-x86_64/src/cpu/syscall.rs):
 //!
-//! | # | Name    |
-//! |---|---------|
-//! | 0 | yield   |
-//! | 1 | exit    |
-//! | 2 | getpid  |
-//! | 3 | send    |
-//! | 4 | recv    |
-//! | 5 | notify  |
+//! | # | Name        |
+//! |---|-------------|
+//! | 0 | yield       |
+//! | 1 | exit        |
+//! | 2 | getpid      |
+//! | 3 | send        | 2-word shorthand (uart-drv byte output)
+//! | 4 | recv        | returns word0 only (uart-drv byte input)
+//! | 5 | notify      |
+//! | 6 | recv_msg    | receive full 8-word Message into user buffer
+//! | 7 | send_msg    | send full 8-word Message from user buffer
 
-/// Voluntarily give up the CPU slice.  The scheduler picks the next
-/// ready process; we resume when our turn comes around again.
+// ── Message struct (must match core_kernel::ipc::Message layout) ─────────────
+//
+// kernel layout (#[repr(C)]):
+//   offset 0:  sender: ProcessId(u32)   = 4 bytes
+//   offset 4:  _pad                     = 4 bytes (u64 alignment)
+//   offset 8:  data: [u64; 8]           = 64 bytes
+//   total: 72 bytes
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Msg {
+    pub sender: u32,
+    pub _pad:   u32,
+    pub data:   [u64; 8],
+}
+
+impl Msg {
+    pub const fn zeroed() -> Self {
+        Msg { sender: 0, _pad: 0, data: [0; 8] }
+    }
+}
+
+// ── Syscall wrappers ──────────────────────────────────────────────────────────
+
 #[inline]
 pub fn yield_cpu() {
     unsafe {
@@ -38,7 +51,6 @@ pub fn yield_cpu() {
     }
 }
 
-/// Terminate this process with an exit code.  Does not return.
 #[inline]
 pub fn exit(code: u64) -> ! {
     unsafe {
@@ -51,7 +63,6 @@ pub fn exit(code: u64) -> ! {
     }
 }
 
-/// Return the calling process's PID.
 #[inline]
 pub fn getpid() -> u32 {
     let ret: u64;
@@ -68,12 +79,7 @@ pub fn getpid() -> u32 {
     ret as u32
 }
 
-/// Send a message to `to_pid`.
-///
-/// `word0` and `word1` are the first two payload words.
-/// The kernel stamps `msg.sender` — the target always sees the real PID.
-///
-/// Returns 0 on success, non-zero on error (EINVAL / EPERM).
+/// Send a 2-word message — used for uart-drv byte output.
 #[inline]
 pub fn send(to_pid: u64, word0: u64, word1: u64) -> u64 {
     let ret: u64;
@@ -93,15 +99,9 @@ pub fn send(to_pid: u64, word0: u64, word1: u64) -> u64 {
     ret
 }
 
-/// Try to receive a message.
+/// Receive one word — used for uart-drv byte input.
 ///
-/// `timeout_ticks` controls blocking behaviour:
-/// - `0`        → non-blocking (returns `u64::MAX` immediately if nothing waiting)
-/// - `u64::MAX` → block forever until a message arrives
-/// - other      → block up to N ticks, then return `u64::MAX`
-///
-/// Returns the first payload word of the received message, or `u64::MAX`
-/// if no message was available within the timeout.
+/// Returns `u64::MAX` if no message within timeout.
 #[inline]
 pub fn recv(timeout_ticks: u64) -> u64 {
     let ret: u64;
@@ -119,11 +119,6 @@ pub fn recv(timeout_ticks: u64) -> u64 {
     ret
 }
 
-/// Post a notification word (bitmask) to `to_pid`'s pending_notification.
-///
-/// Cheaper than a full `send` — no mailbox slot consumed, just ORed into
-/// a single u64.  The receiver calls `poll_notification()` to consume it.
-/// If `to_pid` was blocked, it is unblocked immediately.
 #[inline]
 pub fn notify(to_pid: u64, word: u64) -> u64 {
     let ret: u64;
@@ -140,4 +135,47 @@ pub fn notify(to_pid: u64, word: u64) -> u64 {
         );
     }
     ret
+}
+
+/// Receive a full Message into `buf`.
+///
+/// Returns `true` if a message was received, `false` on timeout.
+#[inline]
+pub fn recv_msg(timeout_ticks: u64, buf: &mut Msg) -> bool {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax")      6u64,
+            in("rdi")      timeout_ticks,
+            in("rsi")      buf as *mut Msg as u64,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret != u64::MAX
+}
+
+/// Send a full Message from `msg`.
+///
+/// The kernel stamps `msg.sender` — user cannot forge source PID.
+/// Returns `true` on success.
+#[inline]
+pub fn send_msg(to_pid: u64, msg: &Msg) -> bool {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax")      7u64,
+            in("rdi")      to_pid,
+            in("rsi")      msg as *const Msg as u64,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret == 0
 }

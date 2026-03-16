@@ -1,11 +1,31 @@
 use crate::io as serial;
+use crate::syscall::{Msg, recv_msg, send_msg};
 use super::line_editor::LineEditor;
 use super::history::History;
+
+// ── VFS IPC constants ─────────────────────────────────────────────────────────
+
+/// Well-known PID for the VFS server (init=1, uart-drv=2, vfs=3).
+const VFS_PID: u64 = 3;
+
+// Opcodes sent to VFS
+const OP_LIST: u64 = 0x20;
+const OP_READ: u64 = 0x22;
+
+// Responses from VFS
+const RESP_ENTRY: u64 = 0x80; // one directory entry (ls)
+const RESP_DONE:  u64 = 0x81; // end of list / end of read
+const RESP_DATA:  u64 = 0x82; // file data chunk (cat)
+const RESP_ERROR: u64 = 0x8F; // error (word1=1 means not found)
+
+/// Ticks to wait for a VFS response before declaring timeout (100 Hz → ~1 s).
+const VFS_TIMEOUT: u64 = 100;
 
 // ── Command registry ─────────────────────────────────────────────────────────
 
 /// All built-in command names, sorted for binary-search tab completion.
 const COMMANDS: &[&[u8]] = &[
+    b"cat",
     b"clear",
     b"echo",
     b"exec",
@@ -14,6 +34,7 @@ const COMMANDS: &[&[u8]] = &[
     b"help",
     b"history",
     b"kill",
+    b"ls",
     b"mem",
     b"ps",
     b"uptime",
@@ -75,6 +96,7 @@ pub fn dispatch(line: &[u8], history: &History) -> Action {
     if cmd.is_empty() { return Action::Continue; }
 
     match cmd {
+        b"cat"     => cmd_cat(&args),
         b"clear"   => cmd_clear(),
         b"echo"    => cmd_echo(&args),
         b"exec"    => cmd_exec(&args),
@@ -89,6 +111,7 @@ pub fn dispatch(line: &[u8], history: &History) -> Action {
         b"help"    => cmd_help(),
         b"history" => cmd_history(history),
         b"kill"    => cmd_kill(&args),
+        b"ls"      => cmd_ls(),
         b"mem"     => cmd_mem(),
         b"ps"      => cmd_ps(),
         b"uptime"  => cmd_uptime(),
@@ -150,14 +173,16 @@ fn cmd_echo(args: &Args<'_>) {
 
 fn cmd_help() {
     serial::print_str("Built-in commands:\n");
+    serial::print_str("  cat <file>         print file contents from VFS\n");
     serial::print_str("  clear              clear the screen\n");
     serial::print_str("  echo <args...>     print arguments\n");
-    serial::print_str("  exec <path>        load and run an ELF binary  [needs VFS]\n");
+    serial::print_str("  exec <path>        load and run an ELF binary  [needs ELF loader]\n");
     serial::print_str("  exit [code]        exit the shell\n");
     serial::print_str("  halt               halt the system\n");
     serial::print_str("  help               show this message\n");
     serial::print_str("  history            list command history\n");
     serial::print_str("  kill <pid>         send SIGTERM notification to a process\n");
+    serial::print_str("  ls                 list files in VFS\n");
     serial::print_str("  mem                show memory usage             [needs kernel API]\n");
     serial::print_str("  ps                 list running processes        [needs kernel API]\n");
     serial::print_str("  uptime             show system tick count        [needs kernel API]\n");
@@ -189,6 +214,100 @@ fn cmd_history(history: &History) {
             for &b in line { serial::put_byte(b); }
         }
         serial::put_byte(b'\n');
+    }
+}
+
+/// `ls` — list files in the VFS RAM disk.
+fn cmd_ls() {
+    let mut req = Msg::zeroed();
+    req.data[0] = OP_LIST;
+    if !send_msg(VFS_PID, &req) {
+        serial::print_str("ls: failed to reach VFS\n");
+        return;
+    }
+
+    let mut found = false;
+    loop {
+        let mut resp = Msg::zeroed();
+        if !recv_msg(VFS_TIMEOUT, &mut resp) {
+            serial::print_str("ls: VFS timeout\n");
+            return;
+        }
+        match resp.data[0] {
+            RESP_DONE => break,
+            RESP_ENTRY => {
+                found = true;
+                let flags = resp.data[1];
+                let size  = resp.data[2];
+                // name packed into data[3..7] (40 bytes, null-terminated)
+                print_packed_name(&resp.data[3..8]);
+                if flags & 1 != 0 { serial::put_byte(b'*'); } // executable marker
+                serial::print_str("\t");
+                print_u64(size);
+                serial::put_byte(b'\n');
+            }
+            _ => {
+                serial::print_str("ls: unexpected response from VFS\n");
+                return;
+            }
+        }
+    }
+    if !found {
+        serial::print_str("(empty)\n");
+    }
+}
+
+/// `cat <file>` — print the contents of a file from the VFS.
+fn cmd_cat(args: &Args<'_>) {
+    let path = args.get(1);
+    if path.is_empty() {
+        serial::print_str("usage: cat <file>\n");
+        return;
+    }
+
+    let (nw0, nw1) = pack_name(path);
+    let mut offset: u64 = 0;
+    let mut total:  u64 = u64::MAX;
+
+    loop {
+        let mut req = Msg::zeroed();
+        req.data[0] = OP_READ;
+        req.data[1] = offset;
+        req.data[2] = nw0;
+        req.data[3] = nw1;
+        if !send_msg(VFS_PID, &req) {
+            serial::print_str("cat: failed to reach VFS\n");
+            return;
+        }
+
+        let mut resp = Msg::zeroed();
+        if !recv_msg(VFS_TIMEOUT, &mut resp) {
+            serial::print_str("cat: VFS timeout\n");
+            return;
+        }
+
+        match resp.data[0] {
+            RESP_DATA => {
+                if total == u64::MAX { total = resp.data[1]; }
+                let chunk_len = resp.data[2] as usize;
+                if chunk_len == 0 { break; }
+                // data packed into data[3..7] (up to 40 bytes)
+                print_packed_bytes(&resp.data[3..8], chunk_len);
+                offset += chunk_len as u64;
+                if offset >= total { break; }
+            }
+            RESP_DONE => break,
+            RESP_ERROR => {
+                serial::print_str("cat: ");
+                for &b in path { serial::put_byte(b); }
+                serial::print_str(": no such file\n");
+                return;
+            }
+            _ => {
+                serial::print_str("cat: unexpected response from VFS\n");
+                return;
+            }
+        }
     }
 }
 
@@ -250,6 +369,41 @@ fn cmd_mem() {
 fn cmd_uptime() {
     serial::print_str("uptime: clock API not yet available\n");
     serial::print_str("       (requires sys_clock_gettime syscall)\n");
+}
+
+// ── VFS name packing helpers ──────────────────────────────────────────────────
+
+/// Pack up to 16 bytes of a filename into two u64 words (little-endian bytes).
+/// Matches `unpack_name` in the VFS server.
+fn pack_name(name: &[u8]) -> (u64, u64) {
+    let mut w0 = 0u64;
+    let mut w1 = 0u64;
+    for (i, &b) in name.iter().enumerate().take(8)  { w0 |= (b as u64) << (i * 8); }
+    for (i, &b) in name.iter().skip(8).enumerate().take(8) { w1 |= (b as u64) << (i * 8); }
+    (w0, w1)
+}
+
+/// Print a null-terminated name packed as little-endian bytes in `words`.
+fn print_packed_name(words: &[u64]) {
+    'outer: for &w in words {
+        for i in 0..8 {
+            let b = (w >> (i * 8)) as u8;
+            if b == 0 { break 'outer; }
+            serial::put_byte(b);
+        }
+    }
+}
+
+/// Print `byte_count` bytes packed little-endian in `words`.
+fn print_packed_bytes(words: &[u64], byte_count: usize) {
+    let mut remaining = byte_count;
+    'outer: for &w in words {
+        for i in 0..8 {
+            if remaining == 0 { break 'outer; }
+            serial::put_byte((w >> (i * 8)) as u8);
+            remaining -= 1;
+        }
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

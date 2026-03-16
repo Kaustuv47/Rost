@@ -27,9 +27,11 @@
 /// | 0 | sys_yield    | Voluntarily give up the CPU |
 /// | 1 | sys_exit     | Terminate calling process |
 /// | 2 | sys_getpid   | Return own ProcessId |
-/// | 3 | sys_send     | IPC send (rdi=to_pid, rsi=msg_ptr — future: after TSS) |
-/// | 4 | sys_recv     | IPC blocking receive (rdi=timeout_ticks) |
+/// | 3 | sys_send     | IPC send 2 words (rdi=to_pid, rsi=w0, rdx=w1) |
+/// | 4 | sys_recv     | IPC blocking receive word0 (rdi=timeout_ticks) |
 /// | 5 | sys_notify   | Send notification word (rdi=to_pid, rsi=word) |
+/// | 6 | sys_recv_msg | Receive full Message → user buffer (rdi=timeout, rsi=ptr) |
+/// | 7 | sys_send_msg | Send full Message from user buffer (rdi=to_pid, rsi=ptr) |
 use super::{rdmsr, wrmsr};
 
 // MSR addresses
@@ -39,12 +41,14 @@ const MSR_LSTAR:  u32 = 0xC000_0082;
 const MSR_SFMASK: u32 = 0xC000_0084;
 
 // Syscall numbers
-const SYS_YIELD:   u64 = 0;
-const SYS_EXIT:    u64 = 1;
-const SYS_GETPID:  u64 = 2;
-const SYS_SEND:    u64 = 3;
-const SYS_RECV:    u64 = 4;
-const SYS_NOTIFY:  u64 = 5;
+const SYS_YIELD:    u64 = 0;
+const SYS_EXIT:     u64 = 1;
+const SYS_GETPID:   u64 = 2;
+const SYS_SEND:     u64 = 3;
+const SYS_RECV:     u64 = 4;
+const SYS_NOTIFY:   u64 = 5;
+const SYS_RECV_MSG: u64 = 6;
+const SYS_SEND_MSG: u64 = 7;
 
 // Error codes
 const ENOSYS:  u64 = u64::MAX;        // -1: function not implemented
@@ -123,6 +127,7 @@ extern "C" fn dispatch_syscall(
     number: u64,
     a0: u64, a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64,
 ) -> u64 {
+    // a0=rdi, a1=rsi, a2=rdx, _a3=r10(→rcx), _a4=r8, _a5=r9
     use core::sync::atomic::Ordering;
 
     match number {
@@ -193,6 +198,68 @@ extern "C" fn dispatch_syscall(
             if let Some(sched) = core_kernel::scheduler::get_global() {
                 let to_pid = core_kernel::process::ProcessId::new(a0 as u32);
                 if sched.notify_process(to_pid, a1) { 0 } else { EINVAL }
+            } else {
+                ENOSYS
+            }
+        }
+
+        // SYS_RECV_MSG — receive one full Message into a user-provided buffer.
+        //
+        // a0 = timeout_ticks
+        // a1 = pointer to a 72-byte user buffer laid out as:
+        //        offset 0: sender u32
+        //        offset 4: _pad   u32
+        //        offset 8: data   [u64; 8]
+        //
+        // Returns 0 on success, u64::MAX on timeout / no message.
+        //
+        // Security: the kernel overwrites msg.sender with the real sender PID
+        // before writing to the buffer, so the user cannot forge sender identity.
+        // Safety: pointer is trusted (ring-3 not yet isolated; identity-mapped).
+        SYS_RECV_MSG => {
+            if let Some(sched) = core_kernel::scheduler::get_global() {
+                let pid = core_kernel::process::ProcessId::new(
+                    core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed));
+                match sched.blocking_receive(pid, a0) {
+                    Some(msg) => {
+                        if a1 != 0 {
+                            unsafe {
+                                core::ptr::write(
+                                    a1 as *mut core_kernel::ipc::Message,
+                                    msg,
+                                );
+                            }
+                        }
+                        0
+                    }
+                    None => u64::MAX,
+                }
+            } else {
+                ENOSYS
+            }
+        }
+
+        // SYS_SEND_MSG — send a full Message from a user-provided buffer.
+        //
+        // a0 = target PID
+        // a1 = pointer to a 72-byte user Msg buffer (same layout as SYS_RECV_MSG)
+        //
+        // The kernel overwrites msg.sender with CURRENT_PID before enqueuing,
+        // so the sender field set by user space is always ignored.
+        //
+        // Returns 0 on success, EINVAL if queue full or bad PID.
+        SYS_SEND_MSG => {
+            if let Some(sched) = core_kernel::scheduler::get_global() {
+                let from_pid = core_kernel::process::ProcessId::new(
+                    core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed));
+                let to_pid = core_kernel::process::ProcessId::new(a0 as u32);
+                let mut msg = if a1 != 0 {
+                    unsafe { core::ptr::read(a1 as *const core_kernel::ipc::Message) }
+                } else {
+                    core_kernel::ipc::Message::new(from_pid)
+                };
+                msg.sender = from_pid; // always overwrite — user cannot forge
+                if sched.send_message(from_pid, to_pid, msg) { 0 } else { EINVAL }
             } else {
                 ENOSYS
             }
