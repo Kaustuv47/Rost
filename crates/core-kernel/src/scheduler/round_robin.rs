@@ -350,6 +350,27 @@ impl Scheduler {
         }
     }
 
+    /// Mark the current process as Ready and exhaust its quantum so the next
+    /// `timer_tick` triggers a context switch.  Used by SYS_YIELD.
+    pub fn yield_current(&self) {
+        if let Some(cpid) = *self.current_process.borrow() {
+            if let Some(pcb) = self.process_table.borrow_mut().get_process(cpid) {
+                pcb.cpu_time = pcb.time_slice; // exhaust quantum
+                if matches!(pcb.state, ProcessState::Running) {
+                    pcb.state = ProcessState::Ready;
+                }
+            }
+        }
+    }
+
+    /// Return the page-table base (PML4 physical address) for `pid`.
+    /// Returns `None` if the process does not exist.
+    pub fn get_process_pml4(&self, pid: ProcessId) -> Option<u64> {
+        self.process_table.borrow_mut()
+            .get_process(pid)
+            .map(|pcb| pcb.page_table_base)
+    }
+
     /// Iterate over the IPC audit log (most recent last).
     pub fn audit_entries(&self) -> alloc::vec::Vec<AuditEntry> {
         self.audit.borrow().iter().copied().collect()

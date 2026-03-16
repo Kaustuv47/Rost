@@ -2,6 +2,18 @@ mod round_robin;
 
 pub use round_robin::{Scheduler, AuditEntry, AuditKind};
 
+/// Physical address of the kernel PML4 table.
+///
+/// Set once during stage 1 memory management; read by SYS_SPAWN when the
+/// caller does not provide an explicit page table base.
+pub static KERNEL_PML4_PHYS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Record the kernel PML4 physical address for use by SYS_SPAWN.
+pub fn set_kernel_pml4(addr: u64) {
+    KERNEL_PML4_PHYS.store(addr, core::sync::atomic::Ordering::Relaxed);
+}
+
 // ── Global scheduler instance ─────────────────────────────────────────────────
 //
 // Initialised once in `kernel::main` before interrupts are enabled.

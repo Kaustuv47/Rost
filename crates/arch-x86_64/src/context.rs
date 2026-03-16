@@ -79,3 +79,42 @@ pub unsafe extern "C" fn switch_context(
         "ret",                        // pop return address from new stack → jump
     );
 }
+
+/// ISR-safe context switch — identical to [`switch_context`] but does **not**
+/// execute `sti` before returning.
+///
+/// Use this variant when the switch is initiated from an interrupt handler.
+/// The `iretq` at the end of the ISR stub restores RFLAGS (including IF) from
+/// the interrupted task's saved state, so there is no need to re-enable
+/// interrupts manually — and doing so before `iretq` would allow the timer ISR
+/// to re-enter before the register-restore sequence completes.
+#[unsafe(naked)]
+pub unsafe extern "C" fn switch_context_noints(
+    old:      *mut TaskContext,
+    new:      *const TaskContext,
+    new_pml4: u64,
+) {
+    core::arch::naked_asm!(
+        "cli",
+        "mov  [rdi +   0], rbx",
+        "mov  [rdi +   8], rbp",
+        "mov  [rdi +  16], r12",
+        "mov  [rdi +  24], r13",
+        "mov  [rdi +  32], r14",
+        "mov  [rdi +  40], r15",
+        "mov  [rdi + 120], rsp",
+        "mov  rbx, [rsi +   0]",
+        "mov  rbp, [rsi +   8]",
+        "mov  r12, [rsi +  16]",
+        "mov  r13, [rsi +  24]",
+        "mov  r14, [rsi +  32]",
+        "mov  r15, [rsi +  40]",
+        "mov  rsp, [rsi + 120]",
+        "test rdx, rdx",
+        "jz   2f",
+        "mov  cr3, rdx",
+        "2:",
+        // No sti — IRETQ in the ISR stub restores RFLAGS (and therefore IF).
+        "ret",
+    );
+}

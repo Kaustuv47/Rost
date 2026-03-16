@@ -143,3 +143,27 @@ pub fn tick_scheduler() {
         }
     }
 }
+
+/// ISR-safe variant of [`tick_scheduler`].
+///
+/// Identical behaviour but calls [`switch_context_noints`] instead of
+/// [`switch_context`], so interrupts remain disabled when the new task's
+/// registers are restored.  The `iretq` at the end of the timer ISR then
+/// restores RFLAGS (including IF) from the interrupted task's saved state.
+///
+/// **Must only be called from within an interrupt handler**, where the CPU has
+/// already cleared IF via the interrupt gate.
+pub fn tick_scheduler_isr() {
+    if let Some(sched) = core_kernel::scheduler::get_global() {
+        if let Some((old, new, pml4, kernel_rsp)) = sched.timer_tick() {
+            if let Some(pid) = sched.current_process() {
+                core_kernel::scheduler::CURRENT_PID
+                    .store(pid.as_u32(), core::sync::atomic::Ordering::Relaxed);
+            }
+            unsafe {
+                tss::set_rsp0(kernel_rsp);
+                crate::context::switch_context_noints(old, new, pml4);
+            }
+        }
+    }
+}

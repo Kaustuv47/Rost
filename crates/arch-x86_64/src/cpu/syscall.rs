@@ -41,19 +41,24 @@ const MSR_LSTAR:  u32 = 0xC000_0082;
 const MSR_SFMASK: u32 = 0xC000_0084;
 
 // Syscall numbers
-const SYS_YIELD:    u64 = 0;
-const SYS_EXIT:     u64 = 1;
-const SYS_GETPID:   u64 = 2;
-const SYS_SEND:     u64 = 3;
-const SYS_RECV:     u64 = 4;
-const SYS_NOTIFY:   u64 = 5;
-const SYS_RECV_MSG: u64 = 6;
-const SYS_SEND_MSG: u64 = 7;
+const SYS_YIELD:      u64 =  0;
+const SYS_EXIT:       u64 =  1;
+const SYS_GETPID:     u64 =  2;
+const SYS_SEND:       u64 =  3;
+const SYS_RECV:       u64 =  4;
+const SYS_NOTIFY:     u64 =  5;
+const SYS_RECV_MSG:   u64 =  6;
+const SYS_SEND_MSG:   u64 =  7;
+const SYS_SPAWN:      u64 =  8; // spawn a new ring-0 process
+const SYS_MAP:        u64 =  9; // map virtual page in current process
+const SYS_REGISTER:   u64 = 10; // register service name → current PID
+const SYS_LOOKUP:     u64 = 11; // look up PID for service name
 
 // Error codes
 const ENOSYS:  u64 = u64::MAX;        // -1: function not implemented
 const EINVAL:  u64 = u64::MAX - 1;    // -2: invalid argument
 pub const EPERM: u64 = u64::MAX - 2;  // -3: operation not permitted
+const ENOMEM:  u64 = u64::MAX - 3;    // -4: out of physical memory
 
 /// Initialise SYSCALL/SYSRET MSRs.
 pub fn init() {
@@ -132,8 +137,12 @@ extern "C" fn dispatch_syscall(
 
     match number {
         SYS_YIELD => {
-            // Cooperative yield: the scheduler will preempt on the next tick.
-            // Mark the current process Ready so pick_next_priority considers it.
+            // Exhaust the current quantum so the next timer tick forces a switch.
+            // The actual switch is deferred to the next timer interrupt (or the
+            // next cooperative tick_scheduler() call in the idle loop).
+            if let Some(sched) = core_kernel::scheduler::get_global() {
+                sched.yield_current();
+            }
             0
         }
 
@@ -262,6 +271,107 @@ extern "C" fn dispatch_syscall(
                 if sched.send_message(from_pid, to_pid, msg) { 0 } else { EINVAL }
             } else {
                 ENOSYS
+            }
+        }
+
+        // SYS_SPAWN — create a new ring-0 kernel process.
+        //
+        // a0 = entry_point (virtual address; must be a valid ring-0 function)
+        // a1 = page_table_base (physical address of PML4; 0 = inherit kernel PML4)
+        // a2 = priority (0–255; 0 = use default 128)
+        //
+        // Returns the new PID on success, EINVAL if the process table is full.
+        SYS_SPAWN => {
+            if let Some(sched) = core_kernel::scheduler::get_global() {
+                let pml4 = if a1 != 0 {
+                    a1
+                } else {
+                    core_kernel::scheduler::KERNEL_PML4_PHYS
+                        .load(Ordering::Relaxed)
+                };
+                match sched.add_process(a0, 0, pml4) {
+                    Some(pid) => {
+                        if a2 > 0 && a2 <= 255 {
+                            sched.set_priority(pid, a2 as u8);
+                        }
+                        pid.as_u32() as u64
+                    }
+                    None => EINVAL,
+                }
+            } else {
+                ENOSYS
+            }
+        }
+
+        // SYS_MAP — map a 4 KB virtual page in the current process's address space.
+        //
+        // a0 = virtual address  (4 KB-aligned)
+        // a1 = physical address (4 KB-aligned; 0 = allocate a new physical page)
+        // a2 = flags            (bit 0 = writable, bit 1 = user-mode accessible)
+        //
+        // Returns 0 on success, ENOMEM if physical memory is exhausted, EINVAL
+        // for a misaligned or otherwise bad address.
+        SYS_MAP => {
+            use core_kernel::memory::{PTE_PRESENT, PTE_WRITABLE, PTE_USER,
+                                      map_page_global, global_alloc_4k};
+
+            if a0 & 0xFFF != 0 { return EINVAL; }
+            if a1 != 0 && a1 & 0xFFF != 0 { return EINVAL; }
+
+            let phys = if a1 != 0 {
+                a1
+            } else {
+                match global_alloc_4k() {
+                    Some(p) => p,
+                    None    => return ENOMEM,
+                }
+            };
+
+            // Find the calling process's PML4.
+            let pml4_phys = if let Some(sched) = core_kernel::scheduler::get_global() {
+                let pid = core_kernel::process::ProcessId::new(
+                    core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed));
+                sched.get_process_pml4(pid)
+                    .unwrap_or_else(|| core_kernel::scheduler::KERNEL_PML4_PHYS
+                        .load(Ordering::Relaxed))
+            } else {
+                return ENOSYS;
+            };
+
+            // For identity-mapped kernel, pml4_phys == pml4_virt.
+            let pml4 = unsafe { &mut *(pml4_phys as *mut core_kernel::memory::PageTable) };
+
+            let mut flags = PTE_PRESENT;
+            if a2 & 1 != 0 { flags |= PTE_WRITABLE; }
+            if a2 & 2 != 0 { flags |= PTE_USER; }
+
+            if map_page_global(pml4, a0, phys, flags) { 0 } else { ENOMEM }
+        }
+
+        // SYS_REGISTER — register the current process as a named service.
+        //
+        // a0 = pointer to null-terminated ASCII service name (≤ 15 bytes)
+        //
+        // Returns 0 on success, EINVAL if the table is full.
+        SYS_REGISTER => {
+            if a0 == 0 { return EINVAL; }
+            let pid = core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed);
+            // Read up to NAME_LEN bytes from user memory (identity-mapped → safe).
+            let name = unsafe { core::slice::from_raw_parts(a0 as *const u8, 16) };
+            if core_kernel::service_registry::register(name, pid) { 0 } else { EINVAL }
+        }
+
+        // SYS_LOOKUP — look up the PID for a named service.
+        //
+        // a0 = pointer to null-terminated ASCII service name
+        //
+        // Returns the PID on success, EINVAL if not found.
+        SYS_LOOKUP => {
+            if a0 == 0 { return EINVAL; }
+            let name = unsafe { core::slice::from_raw_parts(a0 as *const u8, 16) };
+            match core_kernel::service_registry::lookup(name) {
+                Some(pid) => pid as u64,
+                None      => EINVAL,
             }
         }
 

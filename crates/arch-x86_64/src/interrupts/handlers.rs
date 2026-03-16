@@ -11,6 +11,7 @@
 /// If `ExceptionFrame.cs & 3 == 3` the fault occurred in ring 3 (user mode).
 /// User faults should terminate the process and notify the health monitor
 /// (PID 1) rather than halting the system.
+use core::sync::atomic::Ordering;
 use super::TICK_COUNT;
 
 // ── Saved register frame ──────────────────────────────────────────────────────
@@ -83,7 +84,8 @@ extern "C" fn handle_divide_by_zero(frame: &ExceptionFrame) {
     hal::uart::print_str(if from_user(frame) { "  origin: user-mode\n" } else { "  origin: kernel\n" });
     dump_registers(frame);
     if from_user(frame) {
-        hal::uart::print_str("  → process fault (TODO: terminate + notify HM)\n");
+        terminate_faulting_process(0xDE);
+        return; // context switch happened; never iretq back to dead process
     }
     hal::uart::print_str("System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
@@ -95,7 +97,8 @@ extern "C" fn handle_general_protection(frame: &ExceptionFrame) {
     hal::uart::print_str(if from_user(frame) { "  origin: user-mode\n" } else { "  origin: kernel\n" });
     dump_registers(frame);
     if from_user(frame) {
-        hal::uart::print_str("  → process fault (TODO: terminate + notify HM)\n");
+        terminate_faulting_process(0x0D);
+        return;
     }
     hal::uart::print_str("System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
@@ -110,7 +113,8 @@ extern "C" fn handle_page_fault(frame: &ExceptionFrame) {
     hal::uart::print_str("\n");
     dump_registers(frame);
     if from_user(frame) {
-        hal::uart::print_str("  → process fault (TODO: terminate + notify HM)\n");
+        terminate_faulting_process(0x0E);
+        return;
     }
     hal::uart::print_str("System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
@@ -141,6 +145,38 @@ extern "C" fn handle_machine_check() {
     hal::uart::print_str("  FATAL: uncorrectable hardware error.\n");
     hal::uart::print_str("  System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
+}
+
+// ── Ring-3 process fault handling ─────────────────────────────────────────────
+
+/// Terminate the current ring-3 process and notify init (PID 1) of the fault.
+///
+/// After terminating, force a context switch so the scheduler picks the next
+/// ready process.  The exception handler returns normally; `iretq` is never
+/// reached for the terminated process.
+fn terminate_faulting_process(fault_code: u64) {
+    use core_kernel::scheduler::{get_global, CURRENT_PID};
+
+    let pid_raw = CURRENT_PID.load(Ordering::Relaxed);
+    hal::uart::print_str("  → terminating ring-3 process PID=");
+    hal::uart::print_hex(pid_raw as u64);
+    hal::uart::print_str(", notifying init\n");
+
+    if let Some(sched) = get_global() {
+        let pid  = core_kernel::process::ProcessId::new(pid_raw);
+        let init = core_kernel::process::ProcessId::new(1);
+
+        // Notify init (PID 1) with fault_code in data[0] and faulting PID in data[1].
+        let mut msg = core_kernel::ipc::Message::new(pid);
+        msg.set_data(0, fault_code);
+        msg.set_data(1, pid_raw as u64);
+        sched.send_message(pid, init, msg);
+
+        sched.terminate_process(pid);
+    }
+
+    // Force the scheduler to switch away from this now-dead process.
+    crate::cpu::tick_scheduler_isr();
 }
 
 /// Catch-all for any unexpected interrupt/exception vector.
@@ -461,39 +497,53 @@ unexpected_stub!(unexpected_vec254,254);
 
 // ── Timer ISR (IRQ0, vector 32) ───────────────────────────────────────────────
 //
-// This ISR performs a full preemptive context switch:
-//   1. Save ALL caller-saved registers onto the interrupted stack.
-//   2. Increment TICK_COUNT atomically.
-//   3. Send EOI to PIC.
-//   4. Call the Rust scheduler's timer_tick() — no switch if still in quantum.
-//   5. If a switch is needed: save remaining callee-saved regs, swap RSP, reload CR3.
-//   6. Restore caller-saved registers from the NEW stack and iretq.
+// Full preemptive context switch:
+//   1. Save all caller-saved registers onto the interrupted stack.
+//   2. Atomically increment TICK_COUNT.
+//   3. Send EOI to master PIC.
+//   4. Call tick_scheduler_isr():
+//      - Advances the scheduler tick counter.
+//      - If the current process's quantum has expired, calls switch_context_noints
+//        (which saves callee-saved + RSP into old context, restores from new context,
+//         and `ret`s into the new process's ISR frame — interrupts stay disabled).
+//      - If no switch is needed, returns immediately.
+//   5. Restore caller-saved registers from the current stack (which may now belong
+//      to a different process if a switch occurred in step 4).
+//   6. IRETQ — restores RIP/CS/RFLAGS (and RSP/SS on ring-3 entry) for the task
+//      that will resume; RFLAGS restoration re-enables interrupts (IF was 1 for
+//      any user-mode task, or 0 for a kernel task that HAD cleared them).
 //
-// For now (before a global SCHEDULER static is wired in) step 4 is omitted and
-// the ISR just increments the counter and returns.  The infrastructure for the
-// full preemptive path is in place.
+// Stack alignment: IRETQ frame (24 B ring-0 / 40 B ring-3) + 9 × 8 B caller-saved
+// = 96 / 112 bytes below the interrupted RSP.  The `sub rsp,8` before the `call`
+// aligns RSP to 16 bytes as required by the System V AMD64 ABI.
 #[unsafe(naked)]
 pub unsafe extern "C" fn timer_interrupt_handler() {
     core::arch::naked_asm!(
-        // Save all caller-saved registers.
+        // ── 1. Save all caller-saved registers ──────────────────────────────
         "push rax", "push rcx", "push rdx",
         "push rdi", "push rsi",
         "push r8",  "push r9", "push r10", "push r11",
 
-        // Atomically increment the tick counter.
+        // ── 2. Atomically increment the global tick counter ─────────────────
         "lock inc qword ptr [{tick}]",
 
-        // EOI to master PIC.
+        // ── 3. EOI to master PIC ────────────────────────────────────────────
         "mov  al, 0x20",
         "out  0x20, al",
 
-        // Restore and return.
+        // ── 4. Run the scheduler; may switch stacks (interrupts stay off) ───
+        "sub  rsp, 8",                  // 16-byte align for call
+        "call {sched}",
+        "add  rsp, 8",
+
+        // ── 5 + 6. Restore registers from whoever is now running, then IRET ─
         "pop  r11", "pop  r10", "pop  r9", "pop  r8",
         "pop  rsi", "pop  rdi",
         "pop  rdx", "pop  rcx", "pop  rax",
-
         "iretq",
-        tick = sym TICK_COUNT,
+
+        tick  = sym TICK_COUNT,
+        sched = sym crate::cpu::tick_scheduler_isr,
     );
 }
 

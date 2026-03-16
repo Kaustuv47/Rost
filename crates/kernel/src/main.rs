@@ -8,6 +8,7 @@ use uefi::prelude::*;
 use core::alloc::{GlobalAlloc, Layout};
 
 mod boot_collector;
+pub mod elf;
 mod shell;
 
 use arch_x86_64::cpu::{GlobalDescriptorTable, InterruptDescriptorTable};
@@ -67,7 +68,13 @@ static mut BOOT_INFO: BootInfo = BootInfo::new();
 /// Priority 255 (lowest) ensures this is only scheduled when the run queue
 /// is otherwise empty.  The `hlt` instruction suspends the CPU until the next
 /// interrupt, avoiding a busy-wait that would burn power and starve the timer.
+///
+/// Interrupts are explicitly enabled at entry because this process may be
+/// scheduled for the first time via the timer ISR (which runs with IF=0); the
+/// IRETQ in the ISR restores RFLAGS but a fresh context switch via
+/// `switch_context_noints` does not call `sti`.
 extern "C" fn idle_process() -> ! {
+    arch_x86_64::cpu::enable_interrupts();
     loop {
         arch_x86_64::cpu::halt();
     }
@@ -246,6 +253,17 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
         );
     }
     let kernel_pml4_phys = core::ptr::addr_of!(*kernel_pml4) as u64;
+
+    // Publish the kernel PML4 address so SYS_SPAWN / SYS_MAP can find it.
+    core_kernel::scheduler::set_kernel_pml4(kernel_pml4_phys);
+
+    // Initialise the global physical bump allocator with the remaining free RAM
+    // after the kernel heap allocation.  This allocator is used by SYS_MAP to
+    // create new page-table nodes and by the ELF loader to back segments.
+    core_kernel::memory::init_global_allocator(
+        kernel_heap + 0x100000, // start after the 1 MB kernel heap
+        phys_size.saturating_sub(0x200000), // reserve 2 MB total for kernel use
+    );
 
     // Enable EFER.NXE, CR0.WP, CR4.SMEP, CR4.SMAP before loading CR3.
     arch_x86_64::cpu::init_protection();

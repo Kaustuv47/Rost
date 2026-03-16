@@ -7,3 +7,4 @@ pub mod ipc;
 pub mod memory;
 pub mod process;
 pub mod scheduler;
+pub mod service_registry;

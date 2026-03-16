@@ -70,16 +70,17 @@ fn ensure_table(entry: &mut u64, alloc: &mut PhysicalAllocator) -> Option<u64> {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Map `virt` → `phys` in the given PML4 table.
+/// Map `virt` → `phys` in the given PML4 table using an explicit flags word.
 ///
-/// Intermediate tables are allocated from `alloc` as needed.
+/// `flags` should include at least `PTE_PRESENT`; add `PTE_WRITABLE` / `PTE_USER`
+/// / `PTE_NO_EXECUTE` as needed.  Intermediate tables are allocated from `alloc`.
 /// Returns `true` on success, `false` if allocation fails.
 pub fn map_page(
-    pml4:     &mut PageTable,
-    virt:     u64,
-    phys:     u64,
-    writable: bool,
-    alloc:    &mut PhysicalAllocator,
+    pml4:  &mut PageTable,
+    virt:  u64,
+    phys:  u64,
+    flags: u64,
+    alloc: &mut PhysicalAllocator,
 ) -> bool {
     let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((virt >> 30) & 0x1FF) as usize;
@@ -100,8 +101,50 @@ pub fn map_page(
         }
     };
 
-    let flags = PTE_PRESENT | if writable { PTE_WRITABLE } else { 0 };
-    unsafe { phys_to_table(pt_phys).entries[pt_idx] = (phys & PTE_ADDR_MASK) | flags; }
+    unsafe { phys_to_table(pt_phys).entries[pt_idx] = (phys & PTE_ADDR_MASK) | (flags & !PTE_HUGE_PAGE); }
+    true
+}
+
+/// Map `virt` → `phys` using the **global** bump allocator for intermediate tables.
+///
+/// This is the syscall-facing variant used by `SYS_MAP`; it does not require
+/// passing a local `PhysicalAllocator`.  Returns `true` on success.
+pub fn map_page_global(
+    pml4:  &mut PageTable,
+    virt:  u64,
+    phys:  u64,
+    flags: u64,
+) -> bool {
+    use super::physical::global_alloc_4k;
+
+    let alloc_fn = |entry: &mut u64| -> Option<u64> {
+        if *entry & PTE_PRESENT == 0 {
+            let p = global_alloc_4k()?;
+            unsafe { core::ptr::write_bytes(p as *mut u8, 0, 4096); }
+            *entry = (p & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE;
+        }
+        Some(*entry & PTE_ADDR_MASK)
+    };
+
+    let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt >> 30) & 0x1FF) as usize;
+    let pd_idx   = ((virt >> 21) & 0x1FF) as usize;
+    let pt_idx   = ((virt >> 12) & 0x1FF) as usize;
+
+    let pdpt_phys = match alloc_fn(&mut pml4.entries[pml4_idx]) {
+        Some(p) => p, None => return false,
+    };
+    let pd_phys = unsafe {
+        match alloc_fn(&mut phys_to_table(pdpt_phys).entries[pdpt_idx]) {
+            Some(p) => p, None => return false,
+        }
+    };
+    let pt_phys = unsafe {
+        match alloc_fn(&mut phys_to_table(pd_phys).entries[pd_idx]) {
+            Some(p) => p, None => return false,
+        }
+    };
+    unsafe { phys_to_table(pt_phys).entries[pt_idx] = (phys & PTE_ADDR_MASK) | (flags & !PTE_HUGE_PAGE); }
     true
 }
 
