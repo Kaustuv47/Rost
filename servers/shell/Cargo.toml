@@ -1,0 +1,12 @@
+[package]
+name    = "rost-shell"
+version = "0.1.0"
+edition = "2021"
+
+# No kernel crate dependencies.
+# The only interface to the kernel is the 6 syscalls in src/syscall.rs.
+# All I/O goes through the uart-drv server via IPC (src/io.rs).
+
+[[bin]]
+name              = "rost-shell"
+path              = "src/main.rs"

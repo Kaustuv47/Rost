@@ -1,0 +1,10 @@
+[build]
+# Ring-3 server binaries target bare x86_64 (no OS ABI).
+# Overrides the workspace-root config which uses x86_64-unknown-uefi.
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-nostdlib",
+    "-C", "no-redzone",
+]
