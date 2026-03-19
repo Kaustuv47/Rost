@@ -306,6 +306,13 @@ fn collect_load_options(
 ) {
     let Ok(img) = bt.open_protocol_exclusive::<LoadedImage>(image_handle) else { return };
 
+    // Capture the kernel PE/COFF image location before boot services are exited.
+    // `info()` returns (image_base_ptr, image_size_bytes); base == phys addr under
+    // identity mapping set up by UEFI.
+    let (img_base, img_size) = img.info();
+    info.kernel_image_base = img_base as u64;
+    info.kernel_image_size = img_size;
+
     if let Some(raw_bytes) = img.load_options_as_bytes() {
         // Load options are a UCS-2 string (2 bytes per char).
         // Project to ASCII: skip high bytes, keep printable low bytes.

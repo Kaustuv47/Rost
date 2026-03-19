@@ -438,7 +438,17 @@ fn cmd_mem() {
 }
 
 fn cmd_uptime() {
-    serial::print_str("uptime: clock API not yet available (needs SYS_CLOCK_GETTIME)\n");
+    let ns = crate::syscall::clock();
+    let secs  = ns / 1_000_000_000;
+    let ms    = (ns % 1_000_000_000) / 1_000_000;
+    let hours = secs / 3600;
+    let mins  = (secs % 3600) / 60;
+    let s     = secs % 60;
+    serial::print_str("up ");
+    print_u64(hours); serial::print_str("h ");
+    print_u64(mins);  serial::print_str("m ");
+    print_u64(s);     serial::print_str("s (");
+    print_u64(ms);    serial::print_str(" ms into current second)\n");
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────

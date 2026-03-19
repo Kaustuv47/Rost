@@ -23,13 +23,28 @@ pub fn init() {
     }
 }
 
-/// Transmit one byte; auto-appends CR after LF
+/// Transmit one byte; auto-appends CR after LF.
+///
+/// Waits for the UART Transmit Holding Register Empty (THRE) bit before
+/// writing.  Bounded to `UART_TIMEOUT` iterations so a broken or absent
+/// UART does not hang the kernel (IEC 61508 §7.4.1 liveness).
 pub fn put_byte(byte: u8) {
+    // ~1 M iterations ≈ 1 ms at typical bus speeds; more than enough for
+    // a 38400-baud UART whose byte time is ~260 µs.
+    const UART_TIMEOUT: u32 = 1_000_000;
     unsafe {
-        while inb(COM1 + 5) & 0x20 == 0 {}
+        let mut t = UART_TIMEOUT;
+        while inb(COM1 + 5) & 0x20 == 0 {
+            t -= 1;
+            if t == 0 { return; }
+        }
         outb(COM1, byte);
         if byte == b'\n' {
-            while inb(COM1 + 5) & 0x20 == 0 {}
+            t = UART_TIMEOUT;
+            while inb(COM1 + 5) & 0x20 == 0 {
+                t -= 1;
+                if t == 0 { return; }
+            }
             outb(COM1, b'\r');
         }
     }

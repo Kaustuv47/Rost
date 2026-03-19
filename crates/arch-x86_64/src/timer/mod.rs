@@ -1,4 +1,5 @@
 mod pic;
+pub mod tsc;
 
 /// Initialize PIT at 100 Hz and configure PIC
 pub fn init() {

@@ -5,7 +5,7 @@ pub mod tss;
 
 pub use gdt::GlobalDescriptorTable;
 pub use idt::{IdtEntry, InterruptDescriptorTable};
-pub use tss::{set_rsp0, load_tss, init_tss};
+pub use tss::{set_rsp0, load_tss, init_tss, SYSCALL_KERN_RSP, SYSCALL_USER_RSP_SAVE};
 
 // ── Basic CPU control ──────────────────────────────────────────────────────────
 
@@ -19,6 +19,24 @@ pub fn disable_interrupts() {
 
 pub fn halt() {
     unsafe { core::arch::asm!("hlt", options(nostack, preserves_flags)); }
+}
+
+/// Invalidate the TLB entry for a single virtual address.
+///
+/// Must be called after any page-table modification that changes an existing
+/// mapping (unmap, remap, permission change) to ensure the CPU does not use a
+/// stale cached translation.  A CR3 reload flushes all TLB entries and
+/// subsumes individual `invlpg` calls, so this is only required for
+/// modifications made while the page table is already active.
+#[inline]
+pub fn invlpg(vaddr: u64) {
+    unsafe {
+        core::arch::asm!(
+            "invlpg [{}]",
+            in(reg) vaddr,
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
 // ── MSR access ────────────────────────────────────────────────────────────────
@@ -93,11 +111,33 @@ pub fn init_protection() {
         core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nostack, nomem));
         core::arch::asm!("mov cr0, {}", in(reg) cr0 | (1u64 << 16), options(nostack, nomem));
 
-        // CR4.SMEP (bit 20) + CR4.SMAP (bit 21)
+        // CR4.SMEP (bit 20) — enabled here, before CR3 load.
+        // CR4.SMAP (bit 21) — enabled via init_smap() AFTER CR3 load (our PML4
+        //   has no PTE_USER pages, so SMAP is safe; UEFI page tables may have
+        //   PTE_USER set which would cause immediate faults if SMAP were enabled
+        //   while still on the UEFI-provided CR3).
+        // CR4.FSGSBASE (bit 16) — enables rdfsbase/wrfsbase/rdgsbase/wrgsbase
+        //   instructions in ring-3, needed for efficient thread-local storage.
         let cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack, nomem));
         core::arch::asm!("mov cr4, {}",
-            in(reg) cr4 | (1u64 << 20) | (1u64 << 21),
+            in(reg) cr4 | (1u64 << 16) | (1u64 << 20),
+            options(nostack, nomem));
+    }
+}
+
+/// Enable CR4.SMAP.
+///
+/// Must be called AFTER [`activate_page_table`] so that the kernel-owned PML4
+/// (with no PTE_USER pages) is active.  Enabling SMAP while the UEFI page table
+/// is loaded may cause an immediate fault because UEFI often marks memory
+/// regions with PTE_USER.
+pub fn init_smap() {
+    unsafe {
+        let cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack, nomem));
+        core::arch::asm!("mov cr4, {}",
+            in(reg) cr4 | (1u64 << 21),
             options(nostack, nomem));
     }
 }
@@ -165,5 +205,11 @@ pub fn tick_scheduler_isr() {
                 crate::context::switch_context_noints(old, new, pml4);
             }
         }
+        // Re-arm the LAPIC one-shot timer for the next event.
+        // In one-shot mode the LAPIC does not restart automatically; we must
+        // write a new ICR here so the next interrupt fires at the right time.
+        // arm_oneshot() is a no-op if the LAPIC has not been initialised.
+        let ticks = sched.ticks_until_next_event();
+        crate::apic::lapic::arm_oneshot(ticks);
     }
 }

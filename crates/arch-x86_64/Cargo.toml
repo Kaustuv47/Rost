@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "x86_64 architecture layer — GDT, IDT, interrupt handlers, PIT/PIC"
 
+[features]
+# Enable SYS_INJECT_FAULT (syscall 25) for exception-handler path testing.
+# Only activated when the top-level kernel crate enables fault-injection.
+fault-injection = []
+
 [dependencies]
 hal = { path = "../hal" }
 core-kernel = { path = "../core-kernel" }

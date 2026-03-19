@@ -7,5 +7,9 @@ name = "rost-shell"
 version = "0.1.0"
 
 [[package]]
+name = "rost-uart-drv"
+version = "0.1.0"
+
+[[package]]
 name = "rost-vfs"
 version = "0.1.0"

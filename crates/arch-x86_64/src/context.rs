@@ -21,6 +21,25 @@
 /// ```
 use core_kernel::process::pcb::TaskContext;
 
+// ── Compile-time layout assertions ────────────────────────────────────────────
+//
+// The naked-asm context-switch routines use hard-coded byte offsets into
+// TaskContext.  If the struct layout ever changes these assertions catch the
+// mismatch at compile time rather than silently corrupting register state.
+//
+// IEC 61508 §7.4.7: safety-critical assembly must be verified against the
+// source language representation.
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(TaskContext, rbx) ==   0);
+    assert!(offset_of!(TaskContext, rbp) ==   8);
+    assert!(offset_of!(TaskContext, r12) ==  16);
+    assert!(offset_of!(TaskContext, r13) ==  24);
+    assert!(offset_of!(TaskContext, r14) ==  32);
+    assert!(offset_of!(TaskContext, r15) ==  40);
+    assert!(offset_of!(TaskContext, rsp) == 120);
+};
+
 /// Switch from the task whose context is at `*old` to the task at `*new`.
 ///
 /// Callee-saved registers and `rsp` are saved into `*old`; they are restored
@@ -77,6 +96,42 @@ pub unsafe extern "C" fn switch_context(
 
         "sti",                        // re-enable interrupts
         "ret",                        // pop return address from new stack → jump
+    );
+}
+
+/// First-run trampoline for ring-3 (user-mode) processes.
+///
+/// This function is used as the fake return address on the kernel stack of a
+/// newly-created ring-3 PCB.  When `switch_context`/`switch_context_noints`
+/// executes `ret` for the first time on such a PCB, execution arrives here.
+///
+/// On entry (from `switch_context`):
+///   r12 = user virtual entry point (set in TaskContext by `ProcessControlBlock::new_ring3`)
+///   r13 = user virtual stack top   (set in TaskContext by `ProcessControlBlock::new_ring3`)
+///
+/// The function builds a five-word IRETQ frame on the kernel stack and executes
+/// `iretq`, which atomically:
+///   1. Loads RIP from the frame   (→ user entry point)
+///   2. Loads CS  = 0x23           (ring-3 code selector: 0x20 | CPL=3)
+///   3. Loads RFLAGS               (IF=1, everything else default)
+///   4. Loads RSP from the frame   (→ user stack top)
+///   5. Loads SS  = 0x1B           (ring-3 data selector: 0x18 | CPL=3)
+///   6. Switches from ring-0 to ring-3
+///
+/// # Safety
+/// Must only be invoked as the entry point of a brand-new ring-3 PCB through
+/// the context-switch mechanism.  `r12` and `r13` must be valid user addresses.
+#[unsafe(naked)]
+pub unsafe extern "C" fn ring3_entry_trampoline() {
+    core::arch::naked_asm!(
+        // r12 = user RIP,  r13 = user RSP  (set by ProcessControlBlock::new_ring3)
+        "push 0x1B",                          // SS  = ring-3 data (0x18 | 3)
+        "push r13",                           // RSP = user stack top
+        "pushfq",                             // RFLAGS
+        "or   qword ptr [rsp], 0x200",        // ensure IF = 1
+        "push 0x23",                          // CS  = ring-3 code (0x20 | 3)
+        "push r12",                           // RIP = user entry point
+        "iretq",
     );
 }
 

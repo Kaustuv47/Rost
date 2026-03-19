@@ -40,6 +40,9 @@ static mut TABLE: [ServiceEntry; MAX_SERVICES] = [
 /// - Returns `false` if the table is full and no existing entry matches.
 pub fn register(name: &[u8], pid: u32) -> bool {
     let key = trim_name(name);
+    // Reject empty names — a zero-length key is indistinguishable from an
+    // uninitialised table slot and would allow spurious lookup matches.
+    if key.is_empty() { return false; }
     unsafe {
         // Update existing entry if name is already registered.
         for entry in TABLE.iter_mut() {
@@ -97,4 +100,80 @@ pub fn unregister_pid(pid: u32) -> bool {
 fn trim_name(name: &[u8]) -> &[u8] {
     let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
     &name[..end]
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Each test uses a globally unique 15-char name (padded with NUL to 16 bytes)
+    // so parallel test threads do not collide.  After each test the entry is
+    // removed via `unregister_pid` to free the slot for subsequent runs.
+
+    #[test]
+    fn test_register_and_lookup() {
+        let name = b"svc_reg_t01\0\0\0\0\0";
+        assert!(register(name, 101), "register must succeed for a new name");
+        assert_eq!(lookup(name), Some(101), "lookup must return the registered PID");
+        unregister_pid(101);
+    }
+
+    #[test]
+    fn test_lookup_nonexistent_returns_none() {
+        let name = b"svc_noent_t02\0\0\0";
+        // Ensure no entry exists first (may have been registered by a previous run).
+        unregister_pid(99999); // harmless if not present
+        assert_eq!(lookup(name), None, "unknown name must return None");
+    }
+
+    #[test]
+    fn test_register_overwrites_existing() {
+        let name = b"svc_overw_t03\0\0\0";
+        assert!(register(name, 201));
+        // Register the same name again with a different PID — must overwrite.
+        assert!(register(name, 202));
+        assert_eq!(lookup(name), Some(202),
+            "second register must overwrite the first PID");
+        unregister_pid(202);
+    }
+
+    #[test]
+    fn test_unregister_makes_lookup_return_none() {
+        let name = b"svc_unreg_t04\0\0\0";
+        assert!(register(name, 301));
+        assert!(unregister_pid(301), "unregister must return true when entry exists");
+        assert_eq!(lookup(name), None, "lookup must return None after unregister");
+    }
+
+    #[test]
+    fn test_unregister_nonexistent_returns_false() {
+        // PID 99998 is not registered (we use unique PIDs per test).
+        assert!(!unregister_pid(99998),
+            "unregister of a non-existent PID must return false");
+    }
+
+    #[test]
+    fn test_trim_name_stops_at_nul() {
+        // Register using a name with an embedded NUL — only the prefix matters.
+        let name_with_nul = b"hello\0world\0\0\0\0\0";
+        let name_prefix   = b"hello\0\0\0\0\0\0\0\0\0\0\0";
+        assert!(register(name_with_nul, 401));
+        // Looking up just the prefix must find the entry (both trim to "hello").
+        assert_eq!(lookup(name_prefix), Some(401),
+            "lookup with matching prefix must find the entry");
+        unregister_pid(401);
+    }
+
+    #[test]
+    fn test_lookup_is_case_sensitive() {
+        let lower = b"svc_case_t06\0\0\0\0";
+        let upper = b"SVC_CASE_T06\0\0\0\0";
+        assert!(register(lower, 501));
+        // Names differ in case — upper-case lookup must NOT match.
+        assert_eq!(lookup(upper), None,
+            "lookup must be case-sensitive");
+        unregister_pid(501);
+    }
 }

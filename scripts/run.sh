@@ -11,5 +11,7 @@ qemu-system-x86_64 \
   -m 512M \
   -drive if=pflash,format=raw,readonly=on,file=/opt/local/share/qemu/edk2-x86_64-code.fd \
   -drive format=raw,file=fat:rw:"$ROOT/build/" \
+  -device ib700,id=watchdog0 \
+  -watchdog-action reset \
   -net none \
   -serial stdio

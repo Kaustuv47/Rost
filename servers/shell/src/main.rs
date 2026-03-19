@@ -37,10 +37,11 @@ use shell::Shell;
 ///   ...
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // Register under "rost-shell" so uart-drv can discover us and push
+    // keystroke IPC messages to our queue.
+    syscall::register(b"rost-shell\0");
+
     // Notify init (PID 1) that the shell is alive.
-    // When the service registry exists this would do a name registration.
-    // For now the notification word is a magic constant the init process
-    // recognises as EVENT_SHELL_READY.
     syscall::notify(1, 0x5348454C_4C524459); // "SHELLRDY" as two u32s
 
     Shell::new().run()

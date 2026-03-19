@@ -462,6 +462,16 @@ pub struct BootInfo {
     /// Sum of all `Usable` region sizes (convenience cache).
     pub total_memory_bytes: u64,
 
+    // ── Kernel image location (from LoadedImage protocol) ────────────────────
+
+    /// Physical base address of the kernel PE/COFF image.
+    /// Identical to the virtual address under identity mapping.
+    /// Zero if the `LoadedImage` protocol was unavailable.
+    pub kernel_image_base: u64,
+    /// Size of the kernel image in bytes (from `LoadedImageProtocol.ImageSize`).
+    /// Zero if the `LoadedImage` protocol was unavailable.
+    pub kernel_image_size: u64,
+
     // ── Display / GPU ─────────────────────────────────────────────────────────
 
     /// All GOP framebuffers found.  `displays.primary()` is the boot console.
@@ -497,16 +507,18 @@ pub struct BootInfo {
 impl BootInfo {
     pub const fn new() -> Self {
         BootInfo {
-            memory_map:        MemoryMap::new(),
+            memory_map:         MemoryMap::new(),
             total_memory_bytes: 0,
-            displays:          DisplayList::new(),
-            acpi:              None,
-            smbios:            None,
-            firmware:          FirmwareInfo::new(),
-            cpu:               CpuInfo::new(),
-            secure_boot:       SecureBootState::Unknown,
-            load_options:      LoadOptions::new(),
-            boot_time:         None,
+            kernel_image_base:  0,
+            kernel_image_size:  0,
+            displays:           DisplayList::new(),
+            acpi:               None,
+            smbios:             None,
+            firmware:           FirmwareInfo::new(),
+            cpu:                CpuInfo::new(),
+            secure_boot:        SecureBootState::Unknown,
+            load_options:       LoadOptions::new(),
+            boot_time:          None,
         }
     }
 }

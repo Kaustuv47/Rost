@@ -19,7 +19,8 @@
 
 use core_kernel::memory::{
     PageTable, map_page_global, global_alloc_4k,
-    PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_NO_EXECUTE,
+    PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_NO_EXECUTE, PTE_ADDR_MASK,
+    frame_tag, FrameKind,
 };
 
 // ── ELF constants ─────────────────────────────────────────────────────────────
@@ -92,17 +93,44 @@ pub struct LoadedElf {
 ///
 /// Returns `None` on any parse error or allocation failure.
 pub fn load(data: &[u8], pml4: Option<&mut PageTable>) -> Option<LoadedElf> {
+    hal::uart::print_str("      [ELF] load enter len=");
+    hal::uart::print_hex(data.len() as u64);
+    hal::uart::print_str("\n");
+
     // ── 1. Parse and validate ELF header ──────────────────────────────────────
 
-    if data.len() < core::mem::size_of::<Elf64Ehdr>() { return None; }
-    let ehdr = unsafe { &*(data.as_ptr() as *const Elf64Ehdr) };
+    if data.len() < core::mem::size_of::<Elf64Ehdr>() {
+        hal::uart::print_str("      [ELF] fail: too small\n"); return None;
+    }
+    // Use read_unaligned: include_bytes! gives 1-byte aligned data but
+    // Elf64Ehdr requires 8-byte alignment; Rust debug builds check this.
+    let ehdr: Elf64Ehdr = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const Elf64Ehdr) };
+    let ehdr = &ehdr;
+    hal::uart::print_str("      [ELF] ehdr read ok\n");
 
-    if ehdr.e_ident[..4] != ELFMAG          { return None; }
-    if ehdr.e_ident[4]   != ELFCLASS64      { return None; }
-    if ehdr.e_ident[5]   != ELFDATA2LSB     { return None; }
-    if ehdr.e_machine    != EM_X86_64       { return None; }
-    if ehdr.e_phentsize  != core::mem::size_of::<Elf64Phdr>() as u16 { return None; }
-    if ehdr.e_phnum      == 0               { return None; }
+    if ehdr.e_ident[0] != 0x7f || &ehdr.e_ident[1..4] != b"ELF" {
+        hal::uart::print_str("      [ELF] fail: magic\n"); return None;
+    }
+    if ehdr.e_ident[4]   != ELFCLASS64      {
+        hal::uart::print_str("      [ELF] fail: class\n"); return None;
+    }
+    if ehdr.e_ident[5]   != ELFDATA2LSB     {
+        hal::uart::print_str("      [ELF] fail: endian\n"); return None;
+    }
+    if ehdr.e_machine    != EM_X86_64       {
+        hal::uart::print_str("      [ELF] fail: machine\n"); return None;
+    }
+    if ehdr.e_phentsize  != core::mem::size_of::<Elf64Phdr>() as u16 {
+        hal::uart::print_str("      [ELF] fail: phentsize\n"); return None;
+    }
+    if ehdr.e_phnum      == 0               {
+        hal::uart::print_str("      [ELF] fail: phnum=0\n"); return None;
+    }
+    hal::uart::print_str("      [ELF] header ok phnum=");
+    hal::uart::print_hex(ehdr.e_phnum as u64);
+    hal::uart::print_str(" entry=");
+    hal::uart::print_hex(ehdr.e_entry);
+    hal::uart::print_str("\n");
 
     // ── 2. Obtain or create the target PML4 ───────────────────────────────────
 
@@ -128,7 +156,8 @@ pub fn load(data: &[u8], pml4: Option<&mut PageTable>) -> Option<LoadedElf> {
         let off = ph_off + i * core::mem::size_of::<Elf64Phdr>();
         if off + core::mem::size_of::<Elf64Phdr>() > data.len() { return None; }
 
-        let phdr = unsafe { &*(data[off..].as_ptr() as *const Elf64Phdr) };
+        let phdr: Elf64Phdr = unsafe { core::ptr::read_unaligned(data[off..].as_ptr() as *const Elf64Phdr) };
+        let phdr = &phdr;
         if phdr.p_type != PT_LOAD { continue; }
 
         let file_end = (phdr.p_offset as usize).checked_add(phdr.p_filesz as usize)?;
@@ -148,6 +177,7 @@ pub fn load(data: &[u8], pml4: Option<&mut PageTable>) -> Option<LoadedElf> {
         let mut page_off: usize = 0;
         while page_off < mem_size {
             let phys_page = global_alloc_4k()?;
+            frame_tag(phys_page, FrameKind::UserOwned);
             unsafe { core::ptr::write_bytes(phys_page as *mut u8, 0, 4096); }
 
             // Copy file data into this page (up to 4 KB or remaining bytes).
@@ -176,21 +206,132 @@ pub fn load(data: &[u8], pml4: Option<&mut PageTable>) -> Option<LoadedElf> {
     Some(LoadedElf { entry: ehdr.e_entry, pml4_phys })
 }
 
-// ── Convenience: spawn an ELF as a new process ───────────────────────────────
+// ── Convenience: spawn an ELF as a new ring-3 process ────────────────────────
 
-/// Load `data` and register the resulting process with the global scheduler.
+/// Number of 4 KB pages to allocate for a process's user-mode stack.
+const USER_STACK_PAGES: usize = 4; // 16 KB
+
+/// Copy kernel page-table entries into a user-process PML4.
+///
+/// When SYSCALL fires from ring-3, CR3 stays as the user's PML4.  Kernel
+/// code, data, and stacks are not mapped there by default, causing a page
+/// fault on the first kernel memory access in the syscall handler.
+///
+/// This function copies kernel intermediate-table entries into the user PML4
+/// for entries the user does not already own:
+///   * PML4 entries [1..512]    — virtual >512 GB (likely empty, defensive)
+///   * PDPT[0] entries [1..512] — virtual 1 GB–512 GB inside PML4[0]
+///   * PD[0]   entries [1..512] — virtual 2 MB–1 GB inside PDPT[0]
+///
+/// PD[0] (0–2 MB) is left untouched; user ELF segments always land there.
+/// Kernel code identity-maps from ~22 MB (PD[11+]) so there is no overlap.
+///
+/// Kernel entries are copied *without* `PTE_USER`, so ring-3 code cannot
+/// reach them and SMAP enforces the boundary.
+unsafe fn merge_kernel_into_user_pml4(user_pml4_phys: u64) {
+    let kernel_pml4_phys = core_kernel::scheduler::KERNEL_PML4_PHYS
+        .load(core::sync::atomic::Ordering::Relaxed);
+    if kernel_pml4_phys == 0 {
+        hal::uart::print_str("      [ELF] merge: no kernel PML4 recorded\n");
+        return;
+    }
+
+    let kern_pml4 = &*(kernel_pml4_phys as *const PageTable);
+    let user_pml4 = &mut *(user_pml4_phys as *mut PageTable);
+
+    // ── Step 1: PML4 entries [1..512] (virtual >512 GB) ─────────────────────
+    for i in 1..512usize {
+        if kern_pml4.entries[i] & PTE_PRESENT != 0 && user_pml4.entries[i] == 0 {
+            user_pml4.entries[i] = kern_pml4.entries[i];
+        }
+    }
+
+    // ── Step 2: PDPT entries [1..512] inside PML4[0] ────────────────────────
+    if kern_pml4.entries[0] & PTE_PRESENT == 0 { return; }
+    if user_pml4.entries[0] & PTE_PRESENT == 0 { return; }
+
+    let kern_pdpt = &*(( kern_pml4.entries[0] & PTE_ADDR_MASK) as *const PageTable);
+    let user_pdpt = &mut *((user_pml4.entries[0] & PTE_ADDR_MASK) as *mut PageTable);
+
+    for i in 1..512usize {
+        if kern_pdpt.entries[i] & PTE_PRESENT != 0 && user_pdpt.entries[i] == 0 {
+            user_pdpt.entries[i] = kern_pdpt.entries[i];
+        }
+    }
+
+    // ── Step 3: PD entries [1..512] inside PDPT[0] ──────────────────────────
+    if kern_pdpt.entries[0] & PTE_PRESENT == 0 { return; }
+    if user_pdpt.entries[0] & PTE_PRESENT == 0 { return; }
+
+    let kern_pd = &*(( kern_pdpt.entries[0] & PTE_ADDR_MASK) as *const PageTable);
+    let user_pd = &mut *((user_pdpt.entries[0] & PTE_ADDR_MASK) as *mut PageTable);
+
+    // PD[0] covers 0–2 MB: user ELF lives here; we deliberately skip it.
+    for i in 1..512usize {
+        if kern_pd.entries[i] & PTE_PRESENT != 0 && user_pd.entries[i] == 0 {
+            user_pd.entries[i] = kern_pd.entries[i];
+        }
+    }
+    hal::uart::print_str("      [ELF] merge_kernel_into_user_pml4 done\n");
+}
+
+/// Load `data` and register the resulting ring-3 process with the global scheduler.
+///
+/// Allocates and maps a user-mode stack into the new process's address space.
+/// The stack is placed at a conventional top address (0x0000_7FFF_FFFF_F000
+/// downward) and the initial RSP is set to the top of this region.
+///
+/// Uses the IRETQ trampoline (`arch_x86_64::context::ring3_entry_trampoline`)
+/// so the process starts in ring-3 (CPL=3) when first scheduled.
 ///
 /// `priority` 0 means "use default (128)".  Returns the new PID, or `None` on
 /// any failure.
 pub fn spawn_elf(data: &[u8], priority: u8) -> Option<core_kernel::process::ProcessId> {
+    hal::uart::print_str("      [DBG] elf size=");
+    hal::uart::print_hex(data.len() as u64);
+    hal::uart::print_str("\n");
     let loaded = load(data, None)?;
+    hal::uart::print_str("      [DBG] load ok, entry=");
+    hal::uart::print_hex(loaded.entry);
+    hal::uart::print_str("\n");
     let sched  = core_kernel::scheduler::get_global()?;
-    let pid    = sched.add_process(loaded.entry, 0, loaded.pml4_phys)?;
+
+    // Allocate and map a user-mode stack.
+    let stack_top_virt: u64 = 0x0000_7FFF_FFFF_F000;
+    let stack_size = USER_STACK_PAGES * 4096;
+    let stack_base_virt = stack_top_virt - stack_size as u64;
+
+    let stack_flags = core_kernel::memory::PTE_PRESENT
+        | core_kernel::memory::PTE_WRITABLE
+        | core_kernel::memory::PTE_USER
+        | core_kernel::memory::PTE_NO_EXECUTE;
+
+    let pml4 = unsafe { &mut *(loaded.pml4_phys as *mut core_kernel::memory::PageTable) };
+
+    for page in 0..USER_STACK_PAGES {
+        let phys = core_kernel::memory::global_alloc_4k()?;
+        unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096); }
+        let virt = stack_base_virt + (page * 4096) as u64;
+        if !core_kernel::memory::map_page_global(pml4, virt, phys, stack_flags) {
+            return None;
+        }
+    }
+
+    // Merge kernel page tables into user PML4 so that the syscall handler
+    // can access kernel code/data/stacks when CR3 is the user's PML4.
+    unsafe { merge_kernel_into_user_pml4(loaded.pml4_phys); }
+
+    // Spawn the process using the ring-3 IRETQ trampoline.
+    let trampoline = arch_x86_64::context::ring3_entry_trampoline as *const () as u64;
+    let pid = sched.add_ring3_process(loaded.entry, stack_top_virt, loaded.pml4_phys, trampoline)?;
     if priority > 0 { sched.set_priority(pid, priority); }
-    hal::uart::print_str("[ELF] loaded entry=");
+
+    hal::uart::print_str("[ELF] entry=");
     hal::uart::print_hex(loaded.entry);
     hal::uart::print_str(" pml4=");
     hal::uart::print_hex(loaded.pml4_phys);
+    hal::uart::print_str(" stack=");
+    hal::uart::print_hex(stack_top_virt);
     hal::uart::print_str(" pid=");
     hal::uart::print_hex(pid.as_u32() as u64);
     hal::uart::print_str("\n");

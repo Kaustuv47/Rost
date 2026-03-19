@@ -12,7 +12,8 @@
 /// User faults should terminate the process and notify the health monitor
 /// (PID 1) rather than halting the system.
 use core::sync::atomic::Ordering;
-use super::TICK_COUNT;
+use super::{TICK_COUNT, LAPIC_EOI_ADDR};
+use core_kernel::crash_log;
 
 // ── Saved register frame ──────────────────────────────────────────────────────
 
@@ -76,6 +77,27 @@ fn from_user(f: &ExceptionFrame) -> bool {
     f.cs & 3 == 3
 }
 
+// ── Crash record helper ───────────────────────────────────────────────────────
+
+/// Write a crash record to the persistent log and flush over serial.
+///
+/// Called from every fatal (ring-0 / unrecoverable) exception handler before
+/// halting.  Uses the current TICK_COUNT and CURRENT_PID for correlation.
+fn record_crash(frame: &ExceptionFrame, vector: u64, cr2: u64) {
+    let tick = TICK_COUNT.load(Ordering::Relaxed);
+    let pid  = core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed);
+    crash_log::write(crash_log::ErrorRecord {
+        magic:  0,  // crash_log::write() stamps the real magic
+        vector,
+        tick,
+        pid:    pid as u64,
+        rip:    frame.rip,
+        rsp:    0,  // ExceptionFrame doesn't expose interrupted RSP (ring-0 same-priv)
+        rflags: frame.rflags,
+        cr2,
+    });
+}
+
 // ── Inner Rust exception handlers ────────────────────────────────────────────
 
 #[cold]
@@ -100,6 +122,7 @@ extern "C" fn handle_general_protection(frame: &ExceptionFrame) {
         terminate_faulting_process(0x0D);
         return;
     }
+    record_crash(frame, 0x0D, 0);
     hal::uart::print_str("System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }
@@ -116,6 +139,7 @@ extern "C" fn handle_page_fault(frame: &ExceptionFrame) {
         terminate_faulting_process(0x0E);
         return;
     }
+    record_crash(frame, 0x0E, cr2);
     hal::uart::print_str("System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }
@@ -126,6 +150,7 @@ extern "C" fn handle_double_fault(frame: &ExceptionFrame) {
     hal::uart::print_str("\n[EXCEPTION #DF — Double Fault]\n");
     hal::uart::print_str("  FATAL: kernel exception handler faulted.\n");
     dump_registers(frame);
+    record_crash(frame, 0x08, 0);
     hal::uart::print_str("  System halted (unrecoverable).\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }
@@ -140,9 +165,11 @@ extern "C" fn handle_nmi() {
 }
 
 #[cold]
-extern "C" fn handle_machine_check() {
+extern "C" fn handle_machine_check(frame: &ExceptionFrame) {
     hal::uart::print_str("\n[EXCEPTION #MC — Machine Check]\n");
     hal::uart::print_str("  FATAL: uncorrectable hardware error.\n");
+    dump_registers(frame);
+    record_crash(frame, 0x12, 0);
     hal::uart::print_str("  System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }
@@ -527,9 +554,17 @@ pub unsafe extern "C" fn timer_interrupt_handler() {
         // ── 2. Atomically increment the global tick counter ─────────────────
         "lock inc qword ptr [{tick}]",
 
-        // ── 3. EOI to master PIC ────────────────────────────────────────────
+        // ── 3a. EOI to master PIC ───────────────────────────────────────────
         "mov  al, 0x20",
         "out  0x20, al",
+
+        // ── 3b. EOI to LAPIC (if initialised) ──────────────────────────────
+        // LAPIC_EOI_ADDR is 0 when running in PIC-only mode; skip the write.
+        "mov  rax, qword ptr [{eoi_addr}]",
+        "test rax, rax",
+        "jz   2f",
+        "mov  dword ptr [rax], 0",
+        "2:",
 
         // ── 4. Run the scheduler; may switch stacks (interrupts stay off) ───
         "sub  rsp, 8",                  // 16-byte align for call
@@ -542,8 +577,9 @@ pub unsafe extern "C" fn timer_interrupt_handler() {
         "pop  rdx", "pop  rcx", "pop  rax",
         "iretq",
 
-        tick  = sym TICK_COUNT,
-        sched = sym crate::cpu::tick_scheduler_isr,
+        tick     = sym TICK_COUNT,
+        eoi_addr = sym LAPIC_EOI_ADDR,
+        sched    = sym crate::cpu::tick_scheduler_isr,
     );
 }
 

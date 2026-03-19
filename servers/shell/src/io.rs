@@ -1,14 +1,14 @@
 //! Terminal I/O for the shell server.
 //!
 //! All reads and writes go through the UART driver server via IPC.
-//! The uart-drv server (servers/uart-drv, PID 2 by convention) owns COM1
-//! and forwards keystrokes to us as IPC messages.
+//! The uart-drv server (servers/uart-drv) owns COM1 and forwards
+//! keystrokes to us as IPC messages.
 //!
 //! # Protocol with uart-drv
 //!
 //! **Write a byte**
 //! ```text
-//!   SYS_SEND(UART_DRV_PID, word0=OP_WRITE, word1=byte_value)
+//!   SYS_SEND(uart_drv_pid, OP_WRITE=0x01, byte_value)
 //! ```
 //!
 //! **Read a byte** (non-blocking)
@@ -23,20 +23,39 @@
 //!   SYS_RECV(timeout=u64::MAX)
 //!   → byte value when uart-drv pushes a keystroke to our mailbox
 //! ```
-//!
-//! Once the service registry (init's name→PID map) is implemented,
-//! `UART_DRV_PID` would be resolved by name lookup rather than a constant.
-
-/// Well-known PID for the UART driver server.
-/// PID 1 = init, PID 2 = uart-drv (by boot-time registration convention).
-const UART_DRV_PID: u64 = 2;
 
 /// IPC opcode: write one byte to the terminal.
 const OP_WRITE: u64 = 0x01;
 
+/// Service name used to locate uart-drv at runtime.
+const UART_DRV_NAME: &[u8] = b"uart-drv\0";
+
+/// Lazily resolved PID of the uart-drv server.
+///
+/// Initialised on the first call to `uart_drv_pid()`, then cached.
+static mut UART_DRV_PID: u64 = u64::MAX;
+
+/// Returns the current PID of the uart-drv server, resolving it if needed.
+fn uart_drv_pid() -> u64 {
+    // Safety: single-threaded ring-3 process; no concurrent modification.
+    unsafe {
+        if UART_DRV_PID == u64::MAX {
+            loop {
+                let pid = crate::syscall::lookup(UART_DRV_NAME);
+                if pid != u64::MAX {
+                    UART_DRV_PID = pid;
+                    break;
+                }
+                crate::syscall::yield_cpu();
+            }
+        }
+        UART_DRV_PID
+    }
+}
+
 /// Write one byte to the terminal via uart-drv.
 pub fn put_byte(b: u8) {
-    crate::syscall::send(UART_DRV_PID, OP_WRITE, b as u64);
+    crate::syscall::send(uart_drv_pid(), OP_WRITE, b as u64);
 }
 
 /// Write a string slice to the terminal.
@@ -68,8 +87,6 @@ pub fn read_byte_blocking() -> u8 {
         if v != u64::MAX {
             return v as u8;
         }
-        // Should not reach here with infinite timeout, but guard against
-        // spurious wakeups from future kernel changes.
         crate::syscall::yield_cpu();
     }
 }

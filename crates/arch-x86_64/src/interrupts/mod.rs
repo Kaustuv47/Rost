@@ -7,6 +7,15 @@ use handlers::*;
 pub static TICK_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Physical address of the LAPIC EOI register (LAPIC base + 0x0B0).
+///
+/// Written by `apic::lapic::init()` after the LAPIC is enabled.  The timer ISR
+/// reads this at every tick and, if non-zero, writes 0 to the address to
+/// acknowledge the LAPIC-delivered interrupt (in addition to the legacy PIC EOI).
+/// 0 means the LAPIC has not been initialised — PIC-only mode.
+pub static LAPIC_EOI_ADDR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 pub use handlers::MAX_ISR_LATENCY;
 
 /// Wire all 256 IDT vectors.

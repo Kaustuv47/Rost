@@ -72,6 +72,21 @@ pub fn init_tss() -> *mut TaskStateSegment {
     }
 }
 
+/// Kernel stack top for the currently running process.
+///
+/// Mirrors TSS.RSP0 and is read by `syscall_entry` to switch from the user
+/// stack to the kernel stack before pushing any registers.  Updated every
+/// context switch alongside TSS.RSP0.
+pub static SYSCALL_KERN_RSP: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Scratch location used by `syscall_entry` to save the user RSP before
+/// switching to the kernel stack.  Only valid between the two instructions
+/// that save and restore it; IF is cleared by SFMASK so no interrupt can
+/// observe a stale value.  Single-core — no lock needed.
+pub static SYSCALL_USER_RSP_SAVE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Update TSS.RSP0 to the given kernel-stack top.
 ///
 /// Must be called on every context switch so that a subsequent syscall or
@@ -82,6 +97,7 @@ pub fn init_tss() -> *mut TaskStateSegment {
 #[inline]
 pub unsafe fn set_rsp0(rsp0: u64) {
     core::ptr::addr_of_mut!(TSS).as_mut().unwrap().rsp0 = rsp0;
+    SYSCALL_KERN_RSP.store(rsp0, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Load the TSS selector (0x28) into the Task Register.
