@@ -33,7 +33,7 @@ stored in a `static BootInfo` that every subsystem reads for its entire lifetime
 
 ```
 [x] UEFI entry point  (#[entry] fn efi_main)
-[x] Serial console    (COM1, 38 400 baud 8N1 via port I/O — works before any driver)
+[x] Serial console    (COM1, 115 200 baud 8N1 via port I/O — works before any driver)
 [x] Firmware info     (vendor string, UEFI revision)
 [x] CPUID collection  (vendor, brand, family/model/stepping, address bits, feature flags)
 [x] Physical memory map  (all UEFI MemoryType regions → MemoryKind)
@@ -259,10 +259,14 @@ ring 0 and ring 3.
         TPR=0, LINT0/LINT1/Error LVT masked, PIT channel 2 calibration (10 ms poll),
         LAPIC timer periodic 100 Hz vector 32, LAPIC_EOI_ADDR set, 8259 PIC masked
       — timer ISR sends LAPIC EOI via LAPIC_EOI_ADDR atomic after PIC EOI
+      — LAPIC MMIO page explicitly mapped before lapic::init() in efi_main Stage 3:
+          map_page_global(KERNEL_PML4, lapic_base, lapic_base, PRESENT|WRITABLE)
+          guards against LAPIC MMIO falling outside the UEFI free-memory map range
       — 3 unit tests: svr_value, lvt_timer_periodic, svr_enable_bit_independent_of_vector
 [x] I/O APIC init   (from MADT; route IRQs through I/O APIC, not 8259)
       — crates/arch-x86_64/src/apic/ioapic.rs: reads IOAPICVER, masks all redirect
         table entries; route_irq() unmaskes individual GSIs on demand
+      — I/O APIC MMIO page explicitly mapped before ioapic::init() (same pattern as LAPIC)
       — IOAPIC_PHYS_ADDR / IOAPIC_GSI_BASE statics set from MADT primary_io_apic()
       — 4 unit tests: redirect_entry_vector, redirect_entry_apic_id,
         redirect_entry_unmasked, masked_entry
@@ -272,6 +276,7 @@ ring 0 and ring 3.
         programs RTADDR, issues SRTP+WBF+TE with GSTS polling
       — permissive passthrough mode (equivalent to no IOMMU security-wise but proves
         hardware enable path; per-device restriction is a future patch)
+      — all IOMMU_BASES[..IOMMU_COUNT] MMIO pages explicitly mapped before iommu::init()
       — IEC 61508 §7.4.3: DMA remapping infrastructure installed at boot
       — 4 unit tests: root_entry_present, root_entry_alignment,
         passthrough_ctx_entry, passthrough_ctx_domain_id
@@ -329,7 +334,7 @@ Creates and destroys processes; owns per-process state for the kernel's lifetime
 [x] ProcessControlBlock
       — TaskContext, kernel_stack_id, kernel_rsp, page_table_base,
         time_slice, cpu_time, priority, mailbox
-      — memory_quota_pages, cpu_budget_ticks, cpu_budget_used,
+      — memory_quota_pages, memory_pages_used, cpu_budget_ticks, cpu_budget_used,
         ipc_rate_limit, ipc_rate_used, total_cpu_ticks, blocked_deadline
 [x] ProcessControlBlock::new()  → Option<Self>
       — allocates kernel stack, writes entry_point to [kern_rsp]
@@ -358,9 +363,10 @@ Creates and destroys processes; owns per-process state for the kernel's lifetime
       — cap_alloc / cap_grant / cap_revoke / cap_slot_rights wrappers in Scheduler
       — Scheduler::cap_slot_rights() used by SYS_CAP_GRANT to distinguish EPERM vs EINVAL
 [x] Process quota fields
-      — memory_quota_pages: u32 (0 = unlimited)
-      — cpu_budget_ticks: u32  (temporal partitioning; 0 = unlimited)
-      — ipc_rate_limit: u16    (max IPC sends per 100-tick window; 0 = unlimited)
+      — memory_quota_pages: u32    (0 = unlimited)
+      — memory_pages_used:  u32    (pages mapped so far; checked + incremented on SYS_MAP / SYS_MAP_SHARE)
+      — cpu_budget_ticks:   u32    (temporal partitioning; 0 = unlimited)
+      — ipc_rate_limit:     u16    (max IPC sends per 100-tick window; 0 = unlimited)
 [x] Ring-3 entry
       — user-space PML4 created by ELF loader; kernel pages merged via merge_kernel_into_user_pml4
       — ring3_entry_trampoline: builds IRETQ frame (RIP/CS=0x23/RFLAGS/RSP/SS=0x1B), iretq
@@ -379,7 +385,11 @@ Decides which process runs next; enforces time isolation between processes.
 [x] add_process(entry, stack, pml4) / schedule() / current_process()
 [x] set_priority(pid, u8) — change process priority at runtime
 [x] set_quotas(pid, memory_pages, cpu_budget, ipc_rate) — apply all resource limits
-[x] yield_current() — mark current process Ready and exhaust quantum (used by SYS_YIELD)
+[x] yield_current() — mark current process Ready and exhaust quantum (timer-deferred fallback)
+[x] yield_switch()  — cooperative yield with immediate context switch (used by SYS_YIELD)
+      — resets current process quantum to 0, marks Ready, picks next via pick_next_priority()
+      — performs switch_context_noints immediately — no timer tick required
+      — returns None if no other Ready process exists (caller continues running)
 [x] get_process_pml4(pid) → Option<u64> — expose page_table_base (used by SYS_MAP)
 [x] timer_tick()
       — increments internal tick; unblocks deadline-expired processes via check_deadlines
@@ -392,15 +402,31 @@ Decides which process runs next; enforces time isolation between processes.
 [x] IPC timeout on blocking_receive(pid, timeout_ticks)
       — stores blocked_deadline = tick + timeout in PCB
       — timer_tick calls check_deadlines() to unblock timed-out processes
+      — timeout_ticks == 0: non-blocking poll — returns None immediately without blocking
 [x] Temporal partitioning (cpu_budget_ticks per process)
       — process is preempted when cpu_budget_used >= cpu_budget_ticks
-      — budget reset at start of next frame (TODO: frame reset hook)
+      — cpu_budget_used reset to 0 every CPU_BUDGET_FRAME_TICKS (1000 ticks = 10 s)
+          by reset_cpu_budget_counters() called inside timer_tick()
+      — IEC 61508 §7.4.1: budgets are window-relative; throttled processes re-admitted
+          each frame instead of being permanently starved
 [x] CPU time accounting  — pcb.total_cpu_ticks incremented every tick
 [x] Kernel invariant assertions (#[cfg(debug_assertions)] check_invariants())
 [x] send_message(from_pid, to_pid, msg) — stamps sender PID, enforces rate limit, audits
 [x] blocking_receive(pid, timeout) — dequeues or blocks with deadline; audits
 [x] terminate_process(pid) — reclaims slot; audits
 [x] audit_entries() → Vec<AuditEntry>  — IPC audit log readable at runtime
+[x] detect_deadlock(waiter, target) → bool
+      — O(32) iterative DFS over waiting_for graph in ProcessTable::detect_cycle()
+      — follows waiting_for links from target; returns true if waiter is reachable
+      — visited[MAX_PROCESSES] bitmap prevents looping on existing cycles
+      — called from SYS_CALL between send and block; returns EDEADLK (-8) on cycle
+      — IEC 61508 §7.4.4: every blocking operation must have a bounded wait time;
+          cycle detection provides a hard guarantee independent of application timeouts
+[x] Memory quota enforcement (check_memory_quota / use_memory_page)
+      — check_memory_quota(pid): read-only; returns false if memory_pages_used >= quota ≠ 0
+      — use_memory_page(pid): increments memory_pages_used (saturating) after successful map
+      — enforced in SYS_MAP and SYS_MAP_SHARE before any physical frame is allocated
+      — IEC 61508 §7.4.5: physical memory footprint of each process is bounded
 
 [x] Preemptive scheduling from timer ISR
       — tick_scheduler_isr() called directly from the timer ISR after EOI
@@ -502,20 +528,27 @@ The hardware boundary between ring 3 and ring 0.
       — restores user RSP from SYSCALL_USER_RSP_SAVE before SYSRETQ
 [x] dispatch_syscall() in Rust — match rax to syscall table
       — SmapGuard: STAC on entry, CLAC on drop — brackets all user-buffer accesses
-[x] SYS_YIELD  (0) — exhausts current quantum via Scheduler::yield_current()
-                     next timer tick forces a context switch
+[x] SYS_YIELD  (0) — immediate cooperative context switch via Scheduler::yield_switch()
+                     picks next Ready process and switches now (no timer tick wait)
+                     arm_oneshot(1) called to keep LAPIC timer alive for deadline wakeups
+                     returns None (no switch) if calling process is the only Ready one
 [x] SYS_EXIT   (1) — terminates calling process via Scheduler::terminate_process()
 [x] SYS_GETPID (2) — returns CURRENT_PID (AtomicU32, updated on every switch)
 [x] SYS_SEND   (3) — wired to Scheduler.send_message(); stamps sender PID; checks rate limit
 [x] SYS_RECV   (4) — wired to Scheduler.blocking_receive(); returns u64::MAX if blocked
+                     timeout=0: non-blocking poll (returns immediately, no context switch)
+                     on block: arm_oneshot(1) + switch_context_noints to keep timer alive
 [x] SYS_NOTIFY (5) — wired to Scheduler.notify_process(); ORs word into pending_notification
 [x] SYS_RECV_MSG (6) — receive full 72-byte Message into user buffer
+                       on block: arm_oneshot(1) to re-arm LAPIC before switch_context_noints
 [x] SYS_SEND_MSG (7) — send full 72-byte Message from user buffer; kernel stamps sender
 [x] SYS_SPAWN    (8) — create a new ring-0 process
                        a0=entry_point, a1=pml4 (0=kernel PML4), a2=priority (0=default 128)
                        returns new PID or EINVAL
 [x] SYS_MAP      (9) — map a 4 KB virtual page in the calling process's address space
                        a0=vaddr (4 KB aligned), a1=paddr (0=allocate), a2=flags (R/W/U)
+                       checks memory_quota_pages before allocation; increments memory_pages_used on success
+                       returns ENOMEM if quota exhausted (IEC 61508 §7.4.5)
                        uses global bump allocator for intermediate page-table nodes
 [x] SYS_REGISTER (10) — register current PID under a ≤15-byte ASCII service name
 [x] SYS_LOOKUP   (11) — return PID for a registered service name
@@ -528,8 +561,9 @@ The hardware boundary between ring 3 and ring 0.
                           directly calls Scheduler::set_realtime(); initial deadline = now + period
 [x] SYS_CALL      (17) — synchronous call/reply IPC primitive
                           a0=to_pid, a1=send_buf, a2=reply_buf, a3=timeout_ticks (0=forever)
-                          atomically: send_message() then blocking_receive()
+                          send_message() → detect_deadlock() → blocking_receive()
                           returns 0 on reply, ETIMEDOUT on timeout, EAGAIN if mailbox full
+                          returns EDEADLK (-8) if cycle detected in waiting_for graph
                           ring-3 wrapper: syscall::call(to_pid, &req, &mut reply, timeout)
 [x] Error codes extended: EAGAIN (-5), ETIMEDOUT (-6) added to dispatch_syscall
 [x] dispatch_syscall a3 argument exposed (renamed from _a3); used by SYS_CALL timeout
@@ -569,7 +603,9 @@ The hardware boundary between ring 3 and ring 0.
 [x] SYS_MAP_SHARE  (22) — allocate shared 4 KB frame, map in caller's VAS, create Memory cap
                           a0=vaddr (4KB-aligned user space), a1=flags (bit0=writable)
                           allocates+zeroes frame, maps with PTE_USER, installs CapKind::Memory
-                          object_id=PFN; returns cap_slot; ENOMEM if OOM
+                          object_id=PFN; returns cap_slot; ENOMEM if OOM or quota exhausted
+                          checks memory_quota_pages before frame allocation;
+                          increments memory_pages_used on success (IEC 61508 §7.4.5)
 [x] SYS_MAP_CAP    (23) — map a shared frame via Memory capability
                           a0=vaddr (caller's VA), a1=cap_slot, a2=flags (bit0=writable)
                           derives frame_phys = cap.object_id<<12; EPERM if not Memory+CAP_R
@@ -577,6 +613,18 @@ The hardware boundary between ring 3 and ring 0.
                           a0=name ptr (16 bytes); returns cap slot index
                           creates CapKind::Channel (CAP_W) in caller's table
                           ENOENT if name not found; ENOMEM if cap table full
+[x] SYS_SPAWN_ELF       (26) — load ring-3 ELF image from caller's user-space buffer
+[x] SYS_RESTART_SERVER  (27) — restart a named server from the kernel's embedded ELF image
+                                a0=ptr to 16-byte null-padded service name
+                                kernel hook maps "uart-drv"/"rost-vfs"/"rost-shell" → ELF data
+                                returns new PID; EINVAL if name unknown or table full
+                                registered alongside SYS_SPAWN_ELF hook at Stage 6
+                          a0=elf_data_ptr, a1=elf_data_len, a2=priority (0=default 128)
+                          validates user pointer; reads ELF with STAC active
+                          uses core_kernel::elf_spawn hook (avoids arch→kernel circular dep)
+                          hook registered at Stage 6 before first server spawn
+                          returns new PID on success; EINVAL on parse fail or table full
+                          ring-3 wrapper: syscall::spawn_elf(buf, priority) → Option<u32>
 ```
 
 ---
@@ -709,7 +757,7 @@ None of them add features — they make the existing features safe enough to cer
 ```
 [x] Unit tests — core-kernel crate  (no arch deps; runs on host with cargo test)
       — lib.rs: #![cfg_attr(not(test), no_std)] — std available in test mode
-      — 109 tests total (run: cargo test -p core-kernel --target x86_64-apple-darwin)
+      — 123 tests total (run: cargo test -p core-kernel --target x86_64-apple-darwin)
       — test_priority_selection: lowest priority number wins
       — test_round_robin_within_priority: equal-priority processes alternate
       — test_edf_preempts_best_effort: RT process preempts even prio=0 BE process
@@ -767,6 +815,16 @@ None of them add features — they make the existing features safe enough to cer
                                register_overwrites_existing, unregister_makes_lookup_none,
                                unregister_nonexistent_returns_false,
                                trim_name_stops_at_nul, lookup_is_case_sensitive
+      [x] process/table.rs   — 6 cycle + budget tests: detect_cycle_no_links,
+                               detect_cycle_chain_no_cycle, detect_cycle_direct,
+                               detect_cycle_indirect, detect_cycle_unknown_pid,
+                               reset_cpu_budget_counters (zeroes all cpu_budget_used)
+      [x] scheduler          — 8 IEC §7.4.4 / §7.4.5 tests:
+                               deadlock: none_when_no_wait_chain, no_cycle_chain,
+                                 direct_cycle (A→B→A), indirect_cycle (A→B→C→A)
+                               memory quota: unlimited (0=no limit), enforced (rejects at limit),
+                                 boundary (exactly-at-limit OK; one-over rejected)
+                               cpu_budget: frame_reset (cpu_budget_used zeroed after 1000 ticks)
 [x] Branch coverage ≥ MC/DC for all kernel modules  (cargo llvm-cov)
       — rust-toolchain.toml: components = ["llvm-tools-preview"]
       — scripts/coverage.sh: cargo llvm-cov --target host --package core-kernel
@@ -824,19 +882,45 @@ in this section.
 The first user-space process; owns the system lifecycle.
 
 ```
-[ ] Launch at kernel boot as PID 1 (via ELF loader — §15)
+[x] Launch at kernel boot as PID 1 (via ELF loader — §15)
+      — servers/init binary (rost-init) embedded in kernel via include_bytes!
+      — spawned BEFORE idle process so PID assignment gives it PID 1
+      — kernel fault handler (terminate_faulting_process) hardcodes PID 1 as target
+      — registers as "init" via SYS_REGISTER on startup
+      — priority 32 (above normal servers; below RT; above shell/uart-drv/vfs)
+      — spawn order: init(PID1) → idle(PID2) → uart-drv(PID3) → vfs(PID4) → shell(PID5)
 [x] Receive fault notifications from kernel
       — kernel sends IPC to PID 1 on any ring-3 #DE/#GP/#PF with fault_code + pid
+      — init decodes fault_code (0xDE/#DE, 0x0D/#GP, 0x0E/#PF) and logs it
+      — matches faulting PID against known critical services
 [x] Service registry (kernel-side)
       — SYS_REGISTER / SYS_LOOKUP already wired in kernel (§11)
-      — init can act as registry broker once it runs as a process
-[ ] Process restart policy
-      — configurable: restart / escalate / ignore per process name
-[ ] System-level safe-state transition
-      — ordered shutdown when a critical process fails unrecoverably
-[ ] Heartbeat from every registered process
-      — process sends heartbeat IPC every N ms; init restarts if missed
+      — init resolves peer PIDs lazily (uart-drv, rost-vfs, rost-shell) via SYS_LOOKUP
+[x] Process restart policy
+      — per-service critical flag: uart-drv and vfs are critical; shell is non-critical
+      — critical crash → ordered_shutdown() → SYS_EXIT(1); watchdog resets the system
+      — non-critical crash → fault logged, system continues
+      — restart (SYS_SPAWN) deferred until §15 SYS_SPAWN is implemented
+[x] System-level safe-state transition
+      — ordered_shutdown(): logs intent, exits with code 1
+      — kernel terminates init; hardware watchdog fires after timeout → system reset
+      — IEC 61508 §7.4.9: reset is the defined safe state for unrecoverable failure
+[x] Heartbeat from every registered process
+      — init tracks last_beat[i] timestamp (via SYS_CLOCK) per service slot
+      — servers send OP_HEARTBEAT (data[0]=0x0001) IPC to init periodically
+      — 5-second timeout: if a registered service misses its deadline, init logs a warning
+      — heartbeat watchdog skips first 300 ms (warmup_ticks) to allow services to register
+[x] Shutdown request opcode
+      — any process can send OP_SHUTDOWN (data[0]=0x00FF) to init
+      — init logs the requester and calls ordered_shutdown()
 [ ] Expose boot log over IPC to diagnostic clients
+      — deferred: requires SYS_CALL (synchronous IPC) + a fixed-size log ring buffer
+[x] Process restart via SYS_RESTART_SERVER (27)
+      — on fault notification, init calls SYS_RESTART_SERVER with the 16-byte service name
+      — kernel hook (restart_server_hook) maps name → embedded ELF and calls spawn_elf
+      — up to MAX_RESTARTS (3) attempts per service; restart_count tracked per ServiceEntry
+      — critical service (uart-drv, vfs): restart exhausted → ordered_shutdown()
+      — non-critical service (shell):     restart exhausted → warn and continue
 ```
 
 ---
@@ -873,27 +957,128 @@ Parses ELF64 images and launches them as new processes.
 ### 16  Shell Server  (servers/shell)
 
 Interactive diagnostic interface over serial; runs as ring-3 ELF binary.
+Implemented as a full zsh-compatible shell — the default interactive shell for Rost.
 
 ```
 [x] Ring-3 ELF binary   (x86_64-unknown-none, servers/shell workspace)
-[x] IPC-based serial I/O  (SYS_SEND / SYS_RECV_MSG to uart-drv PID 2)
+[x] Serial I/O via SYS_UART_WRITE (12) for output — bypasses uart-drv IPC queue
+      — eliminates queue-overflow byte loss during banner/prompt burst writes
+      — put_byte() / put_newline() / print_str() all call SYS_UART_WRITE directly
+      — put_newline() sends explicit \r\n; print_str() translates every \n → \r\n
+[x] Input via SYS_RECV (IPC from uart-drv) — non-blocking poll + yield_cpu() idle loop
+      — read_byte(): SYS_RECV(timeout=0) — returns immediately, no context switch
+      — idle path: yield_cpu() → immediate switch to uart-drv via SYS_YIELD yield_switch()
+[x] CRLF absorber in escape parser (last_cr field)
+      — terminal sends \r\n on Enter; \r → Key::Enter, subsequent \n absorbed silently
+      — prevents double Enter events from CRLF terminal input
 [x] Interactive UART read loop
-[x] In-place line editing (insert/delete at cursor, Home/End, arrow keys)
-[x] VT100/xterm escape sequence parser (arrow keys, Delete, Ctrl+C/L)
-[x] Command history (32 entries, circular, skips duplicates)
-[x] Tab completion (sorted COMMANDS table, prefix match)
-[x] Dynamic prompt  (rost@local:<cwd>$)
-[x] Commands: echo, help, clear, history, halt, exit, ps, mem, uptime, kill, exec
-[x] ls [path]     — list directory via VFS OP_READDIR (colour: blue=dir, green=exec)
-[x] cat <path>    — read file via VFS OP_READ (chunked, stateless)
-[x] cd <path>     — update cwd (resolve .., ., absolute, relative)
-[x] pwd           — print current working directory
-[x] mount         — display mount table via VFS OP_MOUNT
 
-[ ] ps command    — requires SYS_GETPID per-process info syscall extension
-[ ] kill <pid>    — send terminate IPC to init for relay
-[ ] load <path>   — load and launch ELF binary from VFS
-[ ] log command   — dump persistent crash log region
+[x] Full emacs-mode line editing
+      — insert / delete at cursor; Backspace / Delete
+      — Ctrl+A / Ctrl+E  (beginning / end of line; same as Home/End)
+      — Ctrl+B / Ctrl+F  (backward / forward char; same as arrow keys)
+      — Alt+B  / Alt+F   (word movement; also Ctrl+Left / Ctrl+Right)
+      — Ctrl+K           (kill to end of line → kill ring)
+      — Ctrl+U           (kill to beginning of line → kill ring)
+      — Ctrl+W           (kill previous word → kill ring)
+      — Ctrl+Y           (yank — paste from kill ring)
+      — Ctrl+D           (delete-char or EOF if line empty → clean exit)
+      — Ctrl+C           (cancel line)
+      — Ctrl+L           (clear screen)
+
+[x] VT100/xterm escape sequence parser
+      — Arrow keys, Home, End, Delete (ESC[A/B/C/D, ESC[H/F, ESC[3~)
+      — ESC O sequences (SS3 — rxvt/xterm alternate form)
+      — ESC [ 1 ; modifier sequences (Ctrl+Arrow → word movement)
+      — Alt+B / Alt+F  (ESC b / ESC f)
+      — All Ctrl+ byte values 0x01–0x1F decoded to named Key enum variants
+
+[x] Ctrl+R incremental reverse history search (zsh-style)
+      — (reverse-i-search)'': prompt while typing query
+      — Each character narrows the search through history
+      — Ctrl+R again: cycle to next older match
+      — Backspace: shorten query, restart from newest match
+      — Enter: accept match and execute; Ctrl+C: cancel, restore original line
+
+[x] Command history (32 entries, circular, skips consecutive duplicates)
+[x] History navigation: Up/Down arrows, Ctrl+P / Ctrl+N
+
+[x] History expansion (zsh-style !-expansion)
+      — !!              last command
+      — !n              nth absolute entry (1 = oldest)
+      — !-n             nth from end (1 = last)
+      — !prefix         last command starting with prefix
+      — Expanded line echoed before execution (zsh behaviour)
+
+[x] Variable store (48 slots; NAME_MAX=32, VAL_MAX=128)
+      — Pre-populated defaults: HOME, USER, SHELL, HOSTNAME, TERM, PATH,
+        PWD, OLDPWD, IFS, LANG
+      — $VAR, ${VAR} expansion in every input line before dispatch
+      — $$ (PID), $? (last exit code), $0 (shell name)
+      — ~  tilde-expansion to $HOME at start of word
+      — PWD / OLDPWD updated on every successful cd
+      — export VAR=val  — set variable; unset VAR — remove it
+      — set / env       — list all variables
+
+[x] Alias table (16 slots; defaults: ll=ls, la=ls, h=history, quit=exit, .=source)
+      — alias [name=val]   — define or list aliases
+      — unalias name       — remove alias
+      — Alias expansion: first token of every line resolved before dispatch
+      — Quote stripping on alias values (single and double quotes)
+
+[x] Compound command execution
+      — cmd1 ; cmd2     execute sequentially
+      — cmd1 && cmd2    execute cmd2 only if cmd1 returns exit code 0
+      — cmd1 || cmd2    execute cmd2 only if cmd1 returns non-zero
+      — Up to 8 segments per input line; quote-aware ; / && / || scanner
+
+[x] Bare variable assignment  (VAR=value with no leading spaces = set var, no dispatch)
+
+[x] Tab completion
+      — Command names: prefix match against sorted COMMANDS table
+      — Path arguments: VFS OP_READDIR of parent dir, filter by name prefix
+      — Single match: complete inline; multiple: list on new line
+      — Path completion also active when partial starts with / or ./
+
+[x] Dynamic prompt  (rost@local:<cwd>$  with ANSI colour)
+
+[x] Full command set:
+      alias / unalias    — alias management
+      cat <path>         — stream file via VFS OP_READ (chunked, stateless)
+      cd [path|~]        — change directory; cd with no args → $HOME
+      clear              — clear screen (ANSI ESC[2J ESC[H)
+      date               — show uptime in days/h/m/s/ms
+      echo [-n] <args>   — print arguments; -n suppresses newline
+      env / set          — list all environment variables
+      exec <path> [pri]  — read ELF from VFS + SYS_SPAWN_ELF (26); prints new PID
+      exit [code]        — exit shell with optional code
+      export VAR=val     — set environment variable
+      false              — return exit code 1
+      halt               — system halt
+      help               — detailed help with keybindings and syntax
+      history            — numbered list of command history
+      kill <pid>         — SYS_NOTIFY(pid, 1) — send SIGTERM
+      log                — crash log location / format info
+      ls [path]          — list directory via VFS OP_READDIR (colour-coded)
+      mem                — physical memory layout summary
+      mount              — display VFS mount table via OP_MOUNT
+      ps                 — list well-known PIDs; shows own PID
+      pwd                — print working directory
+      set                — list all shell variables (alias for env)
+      sleep <n>          — sleep n seconds (SYS_RECV timeout = n × 100 ticks)
+      source <file> / .  — read and execute script from VFS (up to 2 KB)
+      test EXPR / [ ]    — -f/-d/-z/-n FILE; A = B; A != B; -eq/-ne/-lt/-le/-gt/-ge
+      true               — return exit code 0
+      type <cmd>         — show whether cmd is builtin, alias, or not found
+      unalias <name>     — remove alias
+      unset <name>       — remove variable
+      uptime             — show h/m/s uptime via SYS_CLOCK
+      which <cmd>        — builtin/alias check; VFS /bin lookup via OP_STAT
+
+[x] exec <path>   — read ELF from VFS, call SYS_SPAWN_ELF (26), print new PID
+                     — /bin/hello (hello-world demo binary) is embedded in the VFS
+                     — 512 KB static EXEC_BUF in shell BSS; ELF magic validated before spawn
+[ ] ps command    — full process list requires kernel process-table IPC extension
 ```
 
 ---
@@ -941,11 +1126,14 @@ All drivers run in ring 3.  A driver crash cannot take down the kernel.
 [ ] Driver model
       — drivers register with init via SYS_REGISTER; receive IRQ notifications via IPC
       — kernel forwards hardware IRQs to registered driver processes
-[x] uart-drv server (PID 2 by convention)  — servers/uart-drv, spawned by kernel via ELF loader
+[x] uart-drv server (PID 3 by convention)  — servers/uart-drv, spawned by kernel via ELF loader
       — registers as "uart-drv" via SYS_REGISTER(10) at startup
-      — main loop: SYS_RECV_MSG for write requests (OP_WRITE=0x01) → SYS_UART_WRITE(12)
+      — main loop: drain SYS_RECV_MSG(0) write requests (OP_WRITE=0x01) → SYS_UART_WRITE(12)
       — polls SYS_UART_READ(13) for keystrokes → SYS_SEND to shell PID
       — looks up shell PID via SYS_LOOKUP("rost-shell")
+      — blocks for 1 tick (SYS_RECV_MSG timeout=1) between polls to pace UART reads;
+        prevents duplicate byte delivery on QEMU HVF where register may not clear instantly
+      — priority 64 (equal to shell); shell gets CPU during uart-drv's 1-tick blocking window
 [ ] Block device driver   (ATA PIO or virtio-blk for QEMU)
 [ ] GOP framebuffer driver
       — maps framebuffer physical address via SYS_MAP

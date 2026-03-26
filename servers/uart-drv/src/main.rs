@@ -38,10 +38,10 @@ use syscall::Msg;
 const OP_WRITE: u64 = 0x01;
 
 /// Service name for registration (null-terminated, padded to 16 bytes).
-const MY_NAME: &[u8] = b"uart-drv\0";
+const MY_NAME: &[u8] = b"uart-drv\0\0\0\0\0\0\0\0";
 
 /// Service name of the shell client we push keystrokes to.
-const SHELL_NAME: &[u8] = b"rost-shell\0";
+const SHELL_NAME: &[u8] = b"rost-shell\0\0\0\0\0\0";
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -49,12 +49,24 @@ pub extern "C" fn _start() -> ! {
     syscall::register(MY_NAME);
 
     // Wait for the shell to register itself.
+    //
+    // IMPORTANT: must BLOCK here, not yield.  SYS_YIELD keeps this process in
+    // the Ready state at priority 64.  Because the shell runs at priority 128
+    // (lower urgency — higher number), a yield loop would starve the shell:
+    // the scheduler always picks the highest-priority ready process (lowest
+    // number), so uart-drv would spin forever and the shell would never get
+    // CPU time to call SYS_REGISTER.
+    //
+    // Blocking with recv_msg(timeout) transitions us to Blocked for 10 ticks
+    // (~100 ms).  While Blocked we are invisible to the scheduler and the
+    // shell runs freely.  On wake-up we retry the lookup.
     let shell_pid = loop {
         let pid = syscall::lookup(SHELL_NAME);
         if pid != u64::MAX {
             break pid;
         }
-        syscall::yield_cpu();
+        let mut dummy = Msg::zeroed();
+        syscall::recv_msg(10, &mut dummy); // block 100 ms → let shell register
     };
 
     let mut msg = Msg::zeroed();
@@ -68,12 +80,20 @@ pub extern "C" fn _start() -> ! {
         }
 
         // Poll UART RX: forward any received bytes to the shell.
+        // Send byte as word0 (data[0]) so SYS_RECV in the shell returns it
+        // directly — SYS_RECV returns data[0] of the message.
         let byte = syscall::uart_read();
         if byte != u64::MAX {
-            syscall::send(shell_pid, 0, byte);
+            syscall::send(shell_pid, byte, 0);
         }
 
-        syscall::yield_cpu();
+        // Block for 1 tick (~10 ms) to pace UART polling.
+        //
+        // yield_cpu() with the new immediate-switch SYS_YIELD causes uart-drv
+        // to re-read the UART register before QEMU has cleared the last byte,
+        // producing duplicate keystroke delivery.  Blocking for 1 tick ensures
+        // the hardware buffer is fully consumed before the next read.
+        syscall::recv_msg(1, &mut msg);
     }
 }
 

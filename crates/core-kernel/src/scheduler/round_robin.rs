@@ -14,6 +14,17 @@ use crate::process::{ProcessId, ProcessState, ProcessTable, ProcList};
 use crate::process::pcb::TaskContext;
 use crate::ipc::Message;
 
+/// Number of scheduler ticks that constitute one major scheduling frame.
+///
+/// CPU budget quotas (`cpu_budget_ticks`) are reset to zero at the start of
+/// each frame so a throttled process regains its allocation without operator
+/// intervention.  At 100 Hz this equals 10 seconds per frame — long enough
+/// to smooth short bursts while short enough to detect persistent overuse.
+///
+/// IEC 61508 §7.4.1: temporal partitioning requires that CPU budgets are
+/// window-relative, not lifetime-relative.
+const CPU_BUDGET_FRAME_TICKS: u64 = 1_000;
+
 // ── IPC Audit Log ─────────────────────────────────────────────────────────────
 
 const AUDIT_CAPACITY: usize = 64;
@@ -159,6 +170,18 @@ impl Scheduler {
         *self.current_process.borrow()
     }
 
+    /// Set the currently-running process without performing a priority pick.
+    ///
+    /// Must be called once during boot after the idle process is registered
+    /// and `CURRENT_PID` is set, so that the first `timer_tick()` call can
+    /// advance the idle process's `cpu_time` and preempt it.
+    ///
+    /// Without this, `timer_tick()` sees `current_process == None` on every
+    /// tick, `preempt` stays `false`, and no context switch ever fires.
+    pub fn set_current(&self, pid: ProcessId) {
+        *self.current_process.borrow_mut() = Some(pid);
+    }
+
     /// Select the highest-priority Ready process (lowest priority number).
     /// Within the same level, round-robin is applied via `queue_index`.
     /// Returns `None` if no process is ready (caller should idle/halt).
@@ -298,9 +321,15 @@ impl Scheduler {
         // Unblock processes whose IPC deadline has elapsed.
         table.check_deadlines(current_tick);
 
-        // Reset IPC rate counters every 100 ticks.
+        // Reset IPC rate counters every 100 ticks (1-second window).
         if current_tick % 100 == 0 {
             table.reset_ipc_rate_counters();
+        }
+
+        // Reset CPU budget counters every major scheduling frame.
+        // This allows throttled processes to run again in the next frame.
+        if current_tick % CPU_BUDGET_FRAME_TICKS == 0 {
+            table.reset_cpu_budget_counters();
         }
 
         let current_pid = *self.current_process.borrow();
@@ -469,6 +498,11 @@ impl Scheduler {
                 });
                 return Some(msg);
             }
+            // timeout=0 is a non-blocking poll: return None immediately without
+            // marking the process Blocked or triggering a context switch.
+            if timeout_ticks == 0 {
+                return None;
+            }
             pcb.state = ProcessState::Blocked;
             pcb.blocked_deadline = if timeout_ticks == u64::MAX {
                 u64::MAX
@@ -504,6 +538,64 @@ impl Scheduler {
         crate::service_registry::unregister_pid(pid.as_u32());
     }
 
+    /// Force-select the next ready process after a termination.
+    ///
+    /// Unlike [`timer_tick`], this does not require `current_process` to be
+    /// `Some`.  It is called from exception handlers after [`terminate_process`]
+    /// sets `current_process = None`, where `timer_tick` would return `None`
+    /// (no preemption flag ever set) and the exception `iretq` would return
+    /// control to the now-dead process.
+    ///
+    /// Returns `(new_ctx_ptr, new_pml4, new_kernel_rsp)` for the chosen
+    /// process, or `None` if no process is ready (caller should halt).
+    pub fn force_schedule_next(&self) -> Option<(*const TaskContext, u64, u64)> {
+        let next_pid = self.pick_next_priority()?;
+        let mut table = self.process_table.borrow_mut();
+        *self.current_process.borrow_mut() = Some(next_pid);
+        table.get_process(next_pid).map(|pcb| {
+            pcb.state = ProcessState::Running;
+            (&pcb.context as *const TaskContext, pcb.page_table_base, pcb.kernel_rsp)
+        })
+    }
+
+    /// Prepare a true blocking context switch from `blocked_pid` to the next ready process.
+    ///
+    /// Called from the SYS_RECV / SYS_RECV_MSG handlers when `blocking_receive`
+    /// returns `None` (mailbox empty, process marked Blocked).  Instead of
+    /// returning u64::MAX and letting the blocked process spin until the next
+    /// timer tick, the syscall handler calls this function to get the context
+    /// pointers and then does `switch_context_noints(old, new, pml4)` directly.
+    ///
+    /// When the blocked process is later rescheduled (deadline expired or a
+    /// message arrived → state=Ready), `tick_scheduler_isr` calls
+    /// `switch_context_noints` which restores the blocked process's kernel stack.
+    /// Execution resumes at the instruction after the `switch_context_noints`
+    /// call inside `dispatch_syscall`; `dispatch_syscall` returns `u64::MAX`;
+    /// `SYSRETQ` returns that to user space.
+    ///
+    /// Returns `(old_ctx, new_ctx, new_pml4, new_kernel_rsp)`, or `None` if no
+    /// other process is ready (caller falls through and returns u64::MAX as before).
+    pub fn prepare_block_switch(
+        &self,
+        blocked_pid: ProcessId,
+    ) -> Option<(*mut TaskContext, *const TaskContext, u64, u64)> {
+        let next_pid = self.pick_next_priority()?;
+        let mut table = self.process_table.borrow_mut();
+
+        let old_ctx = table.get_process(blocked_pid)
+            .map(|pcb| &mut pcb.context as *mut TaskContext)?;
+
+        *self.current_process.borrow_mut() = Some(next_pid);
+
+        let (new_ctx, new_pml4, new_kern_rsp) = table.get_process(next_pid)
+            .map(|pcb| {
+                pcb.state = ProcessState::Running;
+                (&pcb.context as *const TaskContext, pcb.page_table_base, pcb.kernel_rsp)
+            })?;
+
+        Some((old_ctx, new_ctx, new_pml4, new_kern_rsp))
+    }
+
     /// Mark the current process as Ready and exhaust its quantum so the next
     /// `timer_tick` triggers a context switch.  Used by SYS_YIELD.
     pub fn yield_current(&self) {
@@ -517,6 +609,56 @@ impl Scheduler {
         }
     }
 
+    /// Cooperative yield with an **immediate** context switch.
+    ///
+    /// Resets the current process's quantum, marks it Ready, then picks the
+    /// next ready process and returns switch parameters — identical to what
+    /// the timer ISR does but without incrementing the tick counter.
+    ///
+    /// Used by `SYS_YIELD` so that `yield_cpu()` gives up the CPU right now
+    /// instead of waiting up to one full timer tick (10 ms at 100 Hz).
+    ///
+    /// Returns `None` if no other process is ready (caller keeps running).
+    pub fn yield_switch(&self) -> Option<(*mut TaskContext, *const TaskContext, u64, u64)> {
+        let cpid = (*self.current_process.borrow())?;
+
+        // Reset quantum and mark Ready so pick_next_priority considers us
+        // a candidate again for the next round.
+        {
+            let mut table = self.process_table.borrow_mut();
+            if let Some(pcb) = table.get_process(cpid) {
+                pcb.cpu_time = 0;
+                if matches!(pcb.state, ProcessState::Running) {
+                    pcb.state = ProcessState::Ready;
+                }
+            }
+        } // table borrow dropped here before pick_next_priority
+
+        let next_pid = self.pick_next_priority()?;
+
+        // Scheduler returned the same process — no other process is ready.
+        if next_pid == cpid {
+            let mut table = self.process_table.borrow_mut();
+            if let Some(pcb) = table.get_process(cpid) {
+                pcb.state = ProcessState::Running;
+            }
+            return None;
+        }
+
+        *self.current_process.borrow_mut() = Some(next_pid);
+
+        let mut table = self.process_table.borrow_mut();
+        let old_ptr = table.get_process(cpid)
+            .map(|pcb| &mut pcb.context as *mut TaskContext)?;
+        let (new_ctx, pml4, kern_rsp) = table.get_process(next_pid)
+            .map(|pcb| {
+                pcb.state = ProcessState::Running;
+                (&pcb.context as *const TaskContext, pcb.page_table_base, pcb.kernel_rsp)
+            })?;
+
+        Some((old_ptr, new_ctx, pml4, kern_rsp))
+    }
+
     /// Return the page-table base (PML4 physical address) for `pid`.
     /// Returns `None` if the process does not exist.
     pub fn get_process_pml4(&self, pid: ProcessId) -> Option<u64> {
@@ -525,9 +667,72 @@ impl Scheduler {
             .map(|pcb| pcb.page_table_base)
     }
 
+    /// Return `(ctx.rsp, kernel_rsp)` for the given process — diagnostic only.
+    pub fn get_ctx_rsp(&self, pid: ProcessId) -> Option<(u64, u64)> {
+        self.process_table.borrow_mut()
+            .get_process(pid)
+            .map(|pcb| (pcb.context.rsp, pcb.kernel_rsp))
+    }
+
     /// Iterate over the IPC audit log (most recent last).
     pub fn audit_entries(&self) -> alloc::vec::Vec<AuditEntry> {
         self.audit.borrow().iter().copied().collect()
+    }
+
+    // ── Deadlock detection ────────────────────────────────────────────────────
+
+    /// Check whether `waiter` blocking on `target` would create a deadlock cycle.
+    ///
+    /// Returns `true` iff `target` already (transitively) waits for `waiter`
+    /// via the chain of `waiting_for` fields, meaning that adding the edge
+    /// `waiter → target` would make the wait-for graph cyclic.
+    ///
+    /// Called from `SYS_CALL` between the send and the block so the kernel
+    /// can return `EDEADLK` instead of parking both processes permanently.
+    ///
+    /// # Complexity
+    /// O(MAX_PROCESSES) = O(32).  No allocation; uses a stack-local visited bitmap.
+    ///
+    /// # IEC 61508 §7.4.4
+    /// All blocking operations must have a bounded wait time.  Cycle detection
+    /// provides a hard guarantee: a process will never block indefinitely because
+    /// of a software-induced deadlock.
+    pub fn detect_deadlock(&self, waiter: ProcessId, target: ProcessId) -> bool {
+        self.process_table.borrow().detect_cycle(waiter, target)
+    }
+
+    // ── Memory quota ──────────────────────────────────────────────────────────
+
+    /// Return `true` iff `pid` is permitted to map one more physical page.
+    ///
+    /// A process with `memory_quota_pages == 0` has an unlimited quota (kernel
+    /// processes, or processes for which no quota has been set).  A process whose
+    /// `memory_pages_used >= memory_quota_pages` has exhausted its allocation.
+    ///
+    /// This is a read-only check — it does **not** increment `memory_pages_used`.
+    /// Call [`use_memory_page`] after a successful mapping to account for it.
+    ///
+    /// IEC 61508 §7.4.5: processes must not exceed their resource allocation.
+    pub fn check_memory_quota(&self, pid: ProcessId) -> bool {
+        let mut table = self.process_table.borrow_mut();
+        match table.get_process(pid) {
+            None      => true, // no PCB (kernel context) — allow unconditionally
+            Some(pcb) =>
+                pcb.memory_quota_pages == 0
+                    || pcb.memory_pages_used < pcb.memory_quota_pages,
+        }
+    }
+
+    /// Record that `pid` has successfully mapped one physical page.
+    ///
+    /// Increments `memory_pages_used` by 1.  Must only be called after
+    /// `check_memory_quota` returned `true` **and** the mapping succeeded,
+    /// so the counter stays in sync with reality.
+    pub fn use_memory_page(&self, pid: ProcessId) {
+        let mut table = self.process_table.borrow_mut();
+        if let Some(pcb) = table.get_process(pid) {
+            pcb.memory_pages_used = pcb.memory_pages_used.saturating_add(1);
+        }
     }
 
     /// Return total CPU ticks consumed by `pid`.
@@ -807,5 +1012,155 @@ mod tests {
         // timer_tick on an empty scheduler does nothing except increment the tick.
         for _ in 0..50 { sched.timer_tick(); }
         assert_eq!(sched.ticks_until_next_event(), 1);
+    }
+
+    // ── §7.4.4  Deadlock detection ────────────────────────────────────────────
+
+    /// detect_deadlock returns false when no waiting_for relationships exist.
+    #[test]
+    fn test_deadlock_none_when_no_wait_chain() {
+        let sched = Scheduler::new();
+        let a = sched.add_process(0x1000, 0, 0).unwrap();
+        let b = sched.add_process(0x2000, 0, 0).unwrap();
+        // No send/receive — no waiting_for links in the graph.
+        assert!(!sched.detect_deadlock(a, b),
+            "no wait chain → no deadlock");
+    }
+
+    /// detect_deadlock returns false when the chain terminates without reaching waiter.
+    #[test]
+    fn test_deadlock_no_cycle_chain() {
+        let sched = Scheduler::new();
+        let a = sched.add_process(0x1000, 0, 0).unwrap();
+        let b = sched.add_process(0x2000, 0, 0).unwrap();
+        let c = sched.add_process(0x3000, 0, 0).unwrap();
+        // B sends to C and blocks waiting for a reply → B.waiting_for = Some(C).
+        let _ = sched.send_message(b, c, dummy_msg());
+        let _ = sched.blocking_receive(b, u64::MAX);
+        // A calling B: chain is B→C, C has no outgoing edge → no cycle.
+        assert!(!sched.detect_deadlock(a, b),
+            "chain B→C with no link back to A must not be a deadlock");
+    }
+
+    /// detect_deadlock returns true for a direct two-party deadlock (A→B→A).
+    ///
+    /// Setup: B has sent to A and is blocked waiting for a reply
+    /// (B.waiting_for = Some(A)).  When A now calls B, the new edge A→B closes
+    /// the cycle A→B→A.
+    #[test]
+    fn test_deadlock_direct_cycle() {
+        let sched = Scheduler::new();
+        let a = sched.add_process(0x1000, 0, 0).unwrap();
+        let b = sched.add_process(0x2000, 0, 0).unwrap();
+        // B sends to A and blocks (B.waiting_for = Some(A)).
+        let _ = sched.send_message(b, a, dummy_msg());
+        let _ = sched.blocking_receive(b, u64::MAX);
+        // A calls B → would add A→B, closing cycle A→B→A.
+        assert!(sched.detect_deadlock(a, b),
+            "direct cycle A→B→A must be detected");
+    }
+
+    /// detect_deadlock returns true for a three-party cycle (A→B→C→A).
+    ///
+    /// Setup:
+    ///   B sends to C then blocks on its own (empty) mailbox → B.waiting_for = Some(C).
+    ///   C sends to A but does NOT call blocking_receive — if C called it, it would
+    ///   immediately dequeue B's message (in C's mailbox) and clear C.waiting_for.
+    ///   After the send, C.waiting_for = Some(A) remains set.
+    ///
+    /// Resulting wait graph: B→C→A.  Adding edge A→B closes the cycle A→B→C→A.
+    #[test]
+    fn test_deadlock_indirect_cycle() {
+        let sched = Scheduler::new();
+        let a = sched.add_process(0x1000, 0, 0).unwrap();
+        let b = sched.add_process(0x2000, 0, 0).unwrap();
+        let c = sched.add_process(0x3000, 0, 0).unwrap();
+        // B sends to C and blocks on its own empty mailbox (B.waiting_for = Some(C)).
+        let _ = sched.send_message(b, c, dummy_msg());
+        let _ = sched.blocking_receive(b, u64::MAX); // B.mailbox empty → B blocks
+        // C sends to A — sets C.waiting_for = Some(A).
+        // We intentionally skip blocking_receive(c): calling it would dequeue
+        // B's message (already in C.mailbox) and clear C.waiting_for = None.
+        let _ = sched.send_message(c, a, dummy_msg()); // C.waiting_for = Some(A)
+        // Graph: B→C→A.  A calling B adds A→B, closing the cycle.
+        assert!(sched.detect_deadlock(a, b),
+            "three-party cycle A→B→C→A must be detected");
+    }
+
+    // ── §7.4.5  Memory quota enforcement ─────────────────────────────────────
+
+    /// check_memory_quota returns true when no quota is set (unlimited).
+    #[test]
+    fn test_memory_quota_unlimited() {
+        let sched = Scheduler::new();
+        let pid = sched.add_process(0x1000, 0, 0).unwrap();
+        // Default quota = 0 = unlimited.
+        for _ in 0..50 {
+            assert!(sched.check_memory_quota(pid),
+                "unlimited quota must always pass");
+            sched.use_memory_page(pid);
+        }
+    }
+
+    /// check_memory_quota returns false once the finite quota is exhausted.
+    #[test]
+    fn test_memory_quota_enforced() {
+        let sched = Scheduler::new();
+        let pid = sched.add_process(0x1000, 0, 0).unwrap();
+        sched.set_quotas(pid, 2, 0, 0); // memory_quota_pages = 2
+        assert!(sched.check_memory_quota(pid), "first page must be allowed");
+        sched.use_memory_page(pid);
+        assert!(sched.check_memory_quota(pid), "second page must be allowed");
+        sched.use_memory_page(pid);
+        assert!(!sched.check_memory_quota(pid),
+            "third page must be rejected (quota=2, used=2)");
+    }
+
+    /// Memory quota boundary: exactly at the limit is still allowed; one over is rejected.
+    #[test]
+    fn test_memory_quota_boundary() {
+        let sched = Scheduler::new();
+        let pid = sched.add_process(0x1000, 0, 0).unwrap();
+        sched.set_quotas(pid, 1, 0, 0); // exactly 1 page allowed
+        assert!(sched.check_memory_quota(pid), "0 of 1 used: must pass");
+        sched.use_memory_page(pid);
+        assert!(!sched.check_memory_quota(pid), "1 of 1 used: must be rejected");
+    }
+
+    // ── §7.4.1  CPU budget frame reset ───────────────────────────────────────
+
+    /// After CPU_BUDGET_FRAME_TICKS timer ticks the budget counter resets so a
+    /// previously throttled process is selectable again.
+    ///
+    /// We drive exactly CPU_BUDGET_FRAME_TICKS ticks through timer_tick().
+    /// The frame boundary fires at tick == CPU_BUDGET_FRAME_TICKS, calling
+    /// reset_cpu_budget_counters().  Afterwards check_memory_quota for the
+    /// process must pass (it was within-limit before the budget was touched)
+    /// and the budget_used should have been zeroed — verifiable via a
+    /// check_memory_quota call with quota set to the used value.
+    #[test]
+    fn test_cpu_budget_frame_reset() {
+        let sched = Scheduler::new();
+        let pid = sched.add_process(0x1000, 0, 0).unwrap();
+        // Quota: 5 pages memory (used as a proxy we can inspect), budget: 5 ticks.
+        sched.set_quotas(pid, 5, 5, 0);
+        sched.set_priority(pid, 1);
+        // Consume the memory quota so check_memory_quota → false.
+        for _ in 0..5 { sched.use_memory_page(pid); }
+        assert!(!sched.check_memory_quota(pid), "quota exhausted before reset");
+        // cpu_budget_used and memory_pages_used are different fields; only
+        // cpu_budget_used resets at frame boundary.  Memory quota has no reset
+        // (it's a lifetime counter); this test focuses on cpu_budget_used.
+        // Drive scheduler to the frame boundary.
+        sched.schedule();
+        for _ in 0..CPU_BUDGET_FRAME_TICKS { let _ = sched.timer_tick(); }
+        // Memory quota is unchanged (no reset expected).
+        assert!(!sched.check_memory_quota(pid),
+            "memory quota must not reset at frame boundary");
+        // CPU budget is reset — we verify indirectly: the process is schedulable
+        // (cpu_budget_used == 0 means it won't be throttled on next quantum).
+        let selected = sched.schedule();
+        assert_eq!(selected, Some(pid),
+            "process must be schedulable after cpu budget frame reset");
     }
 }

@@ -48,8 +48,10 @@
 /// | 21 | sys_send_cap  | Send 72-byte message via a channel capability |
 /// | 22 | sys_map_share  | Allocate shared 4 KB frame, map, return Memory cap slot |
 /// | 23 | sys_map_cap    | Map a shared frame via a Memory capability |
-/// | 24 | sys_lookup_cap  | Lookup service name → Channel capability slot (unforgeable) |
-/// | 25 | sys_inject_fault | (fault-injection feature only) Trigger CPU exception for testing |
+/// | 24 | sys_lookup_cap   | Lookup service name → Channel capability slot (unforgeable) |
+/// | 25 | sys_inject_fault    | (fault-injection feature only) Trigger CPU exception for testing |
+/// | 26 | sys_spawn_elf       | Load ring-3 ELF image from user buffer and spawn a new process |
+/// | 27 | sys_restart_server  | Restart a named server using the kernel's embedded ELF image |
 use super::{rdmsr, wrmsr};
 
 // MSR addresses
@@ -86,6 +88,8 @@ const SYS_MAP_CAP:     u64 = 23; // map a shared frame into caller's VAS via Mem
 const SYS_LOOKUP_CAP:  u64 = 24; // lookup service name → Channel capability slot index
 #[cfg(feature = "fault-injection")]
 const SYS_INJECT_FAULT: u64 = 25; // trigger CPU exception for handler-path testing
+const SYS_SPAWN_ELF:       u64 = 26; // load ring-3 ELF from user buffer + spawn process
+const SYS_RESTART_SERVER:  u64 = 27; // restart a named server via kernel-embedded ELF
 
 // Error codes
 const ENOSYS:    u64 = u64::MAX;      // -1: function not implemented
@@ -95,6 +99,7 @@ const ENOMEM:    u64 = u64::MAX - 3;  // -4: out of physical memory
 const EAGAIN:    u64 = u64::MAX - 4;  // -5: resource temporarily unavailable
 const ETIMEDOUT: u64 = u64::MAX - 5;  // -6: operation timed out
 const ENOENT:    u64 = u64::MAX - 6;  // -7: no such entry (service not registered)
+const EDEADLK:   u64 = u64::MAX - 7;  // -8: deadlock cycle detected in IPC wait graph
 
 // ── Syscall argument validation ───────────────────────────────────────────────
 
@@ -203,10 +208,19 @@ pub unsafe extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
         // ── Switch from user stack to kernel stack ────────────────────────────
         // RSP = user RSP at this point (SYSCALL does not switch stacks).
-        // Save user RSP to kernel static (non-PTE_USER: SMAP does not apply).
+        // Save user RSP to a scratch static (non-PTE_USER: SMAP does not apply).
         "mov qword ptr [{user_rsp}], rsp",
         // Load the current process's kernel stack top (also kernel static).
         "mov rsp, qword ptr [{kern_rsp}]",
+        // Push user RSP onto the PER-PROCESS kernel stack FIRST.
+        //
+        // Critical: pushing onto the kernel stack (not the global scratch) makes
+        // the user RSP part of this process's saved frame.  Blocking context
+        // switches (SYS_RECV / SYS_RECV_MSG) may cause another process to run
+        // its own syscalls, overwriting SYSCALL_USER_RSP_SAVE.  By embedding the
+        // user RSP in the kernel-stack frame we guarantee the correct value is
+        // restored via `pop rsp` even after an arbitrary number of context switches.
+        "push qword ptr [{user_rsp}]",  // user RSP (deepest slot; popped last)
 
         // ── Push registers onto the kernel stack ──────────────────────────────
         "push rcx",     // user RIP  (saved by SYSCALL into rcx)
@@ -217,11 +231,20 @@ pub unsafe extern "C" fn syscall_entry() {
         "push r13",
         "push r14",
         "push r15",
-        // Move r10 (4th syscall arg in Linux ABI) into rcx for the Rust call.
-        // r10 is unchanged since entry (only user_rsp_save/rsp were modified).
-        "mov  rcx, r10",
-        // Dispatch: rax=number, rdi=a0, rsi=a1, rdx=a2, rcx=a3, r8=a4, r9=a5
+        // Rearrange registers for extern "sysv64" dispatch_syscall(number,a0..a4):
+        //   SysV first arg = RDI, but SYSCALL puts: RAX=number, RDI=a0, RSI=a1,
+        //   RDX=a2, R10=a3, R8=a4.  Shuffle so RDI=number, RSI=a0, …, R8=a3.
+        //   Do the shift in dependency order (each dest is not yet a live source).
+        "mov  rcx, r10",   // rcx = a3  (R10 clobbered by SYSCALL; capture it first)
+        "mov  r9,  r8",    // r9  = a4  (old R8; shift right to make room)
+        "mov  r8,  rcx",   // r8  = a3  (old R10, now in RCX)
+        "mov  rcx, rdx",   // rcx = a2
+        "mov  rdx, rsi",   // rdx = a1
+        "mov  rsi, rdi",   // rsi = a0
+        "mov  rdi, rax",   // rdi = number  (syscall number from RAX → first SysV arg)
+        "sub  rsp, 8",     // 16-byte align for call
         "call {dispatch}",
+        "add  rsp, 8",
 
         // ── Restore registers from kernel stack ───────────────────────────────
         "pop  r15",
@@ -234,7 +257,10 @@ pub unsafe extern "C" fn syscall_entry() {
         "pop  rcx",     // RIP for SYSRETQ
 
         // ── Switch back to user stack and return to ring-3 ────────────────────
-        "mov  rsp, qword ptr [{user_rsp}]",
+        // Restore user RSP from the kernel-stack frame (pushed first, popped last).
+        // Reads from kernel stack (non-PTE_USER) → SMAP safe.  sysretq then
+        // executes with RSP pointing to user stack, preserving rax (return value).
+        "pop  rsp",
         "sysretq",
 
         user_rsp  = sym super::tss::SYSCALL_USER_RSP_SAVE,
@@ -245,18 +271,23 @@ pub unsafe extern "C" fn syscall_entry() {
 
 /// Rust syscall dispatcher.
 ///
-/// Arguments follow the System V AMD64 ABI after the naked stub's fixup:
-///   rax = syscall number  →  first argument to this function
-///   rdi = a0, rsi = a1, rdx = a2, rcx = a3 (was r10), r8 = a4, r9 = a5
+/// The SYSCALL stub shuffles registers so that `extern "sysv64"` receives them
+/// in the standard SysV AMD64 integer-argument order (rdi, rsi, rdx, rcx, r8, r9):
+///   rdi = number  (was rax — syscall number)
+///   rsi = a0      (was rdi — first user arg)
+///   rdx = a1      (was rsi)
+///   rcx = a2      (was rdx)
+///   r8  = a3      (was r10 — 4th Linux-ABI syscall arg)
+///   r9  = _a4     (was r8)
 ///
 /// Returns the value to place in rax (the caller's return value).
-extern "C" fn dispatch_syscall(
+extern "sysv64" fn dispatch_syscall(
     number: u64,
-    a0: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64,
+    a0: u64, a1: u64, a2: u64, a3: u64, _a4: u64,
 ) -> u64 {
-    // a0=rdi, a1=rsi, a2=rdx, _a3=r10(→rcx), _a4=r8, _a5=r9
+    // number=rdi, a0=rsi(old rdi), a1=rdx(old rsi), a2=rcx(old rdx),
+    // a3=r8(old r10), _a4=r9(old r8)
     use core::sync::atomic::Ordering;
-
     // Allow the kernel to access user-mode pages for the duration of this
     // syscall.  CR4.SMAP prevents supervisor access to PTE_USER pages unless
     // RFLAGS.AC is set.  STAC sets AC; the RAII guard clears it on drop.
@@ -271,17 +302,42 @@ extern "C" fn dispatch_syscall(
 
     match number {
         SYS_YIELD => {
-            // Exhaust the current quantum so the next timer tick forces a switch.
-            // The actual switch is deferred to the next timer interrupt (or the
-            // next cooperative tick_scheduler() call in the idle loop).
+            // Immediately switch to the next ready process instead of waiting
+            // for the next timer tick (up to 10 ms at 100 Hz).  This is what
+            // makes yield_cpu() feel instant: uart-drv yields → shell runs now,
+            // shell yields → uart-drv runs now.
             if let Some(sched) = core_kernel::scheduler::get_global() {
-                sched.yield_current();
+                if let Some((old, new, pml4, kern_rsp)) = sched.yield_switch() {
+                    if let Some(next_pid) = sched.current_process() {
+                        core_kernel::scheduler::CURRENT_PID
+                            .store(next_pid.as_u32(), Ordering::Relaxed);
+                    }
+                    // Keep the timer alive so blocked-process deadlines still fire.
+                    crate::apic::lapic::arm_oneshot(1);
+                    unsafe {
+                        super::tss::set_rsp0(kern_rsp);
+                        crate::context::switch_context_noints(old, new, pml4);
+                    }
+                }
             }
             0
         }
 
         SYS_EXIT => {
-            // Terminate the calling process.
+            // Terminate the calling process and immediately switch to the next
+            // ready process.
+            //
+            // We cannot simply return from the syscall here: after
+            // terminate_process() sets current_process = None, sysretq would
+            // jump back to the dead process's user-space code.  If that code
+            // calls another syscall or accesses memory it may fault, and the
+            // fault handler would see current_process = None → no context
+            // switch → the same trap as the terminate_faulting_process bug.
+            //
+            // Instead: terminate, pick next, switch directly.  The syscall
+            // entry frame on the kernel stack is abandoned (we never return
+            // to syscall_entry), but the dead process is gone and its kernel
+            // stack may be reused for a future process.
             hal::uart::print_str("[SYS_EXIT] process exit code=");
             hal::uart::print_hex(a0);
             hal::uart::print_str("\n");
@@ -289,10 +345,30 @@ extern "C" fn dispatch_syscall(
                 let pid = core_kernel::process::ProcessId::new(
                     core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed));
                 sched.terminate_process(pid);
-                // The process will not be scheduled again; it resumes here once
-                // before the next tick selects a different process — that is
-                // acceptable because it returns to user space, which should not
-                // execute meaningful code after SYS_EXIT returns.
+
+                if let Some((new_ctx, new_pml4, kernel_rsp)) = sched.force_schedule_next() {
+                    if let Some(next_pid) = sched.current_process() {
+                        core_kernel::scheduler::CURRENT_PID
+                            .store(next_pid.as_u32(), Ordering::Relaxed);
+                    }
+                    crate::apic::lapic::arm_oneshot(1);
+                    unsafe {
+                        super::tss::set_rsp0(kernel_rsp);
+                        // EXCEPTION_DEAD_CTX in handlers.rs is for exception
+                        // paths; we need our own scratch area here.
+                        static mut EXIT_DEAD_CTX: core_kernel::process::pcb::TaskContext =
+                            core_kernel::process::pcb::TaskContext::zero();
+                        crate::context::switch_context_noints(
+                            core::ptr::addr_of_mut!(EXIT_DEAD_CTX),
+                            new_ctx,
+                            new_pml4,
+                        );
+                        core::hint::unreachable_unchecked();
+                    }
+                }
+                // No ready process — re-enable interrupts and wait.
+                unsafe { core::arch::asm!("sti", options(nostack, preserves_flags)); }
+                loop { unsafe { core::arch::asm!("hlt", options(nostack, nomem)); } }
             }
             a0
         }
@@ -320,20 +396,45 @@ extern "C" fn dispatch_syscall(
 
         SYS_RECV => {
             // a0 = timeout_ticks (u64::MAX = no timeout)
-            // If a message is waiting, returns the first payload word.
-            // If no message, blocks the process (it won't be scheduled until a
-            // sender unblocks it or the deadline expires) and returns u64::MAX.
-            // User-space should treat u64::MAX as "retry needed" and loop.
+            // If a message is waiting, return the first payload word immediately.
+            // If no message: mark this process Blocked, then context-switch to the
+            // next ready process so we don't waste CPU spinning.  When this process
+            // is rescheduled (deadline expired or a send() woke us), execution
+            // resumes at the instruction after switch_context_noints; dispatch_syscall
+            // returns u64::MAX; SYSRETQ delivers that to user space.
             if let Some(sched) = core_kernel::scheduler::get_global() {
                 let pid = core_kernel::process::ProcessId::new(
                     core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed));
                 match sched.blocking_receive(pid, a0) {
-                    Some(msg) => msg.get_data(0),
-                    None      => u64::MAX, // blocked — retry when rescheduled
+                    Some(msg) => return msg.get_data(0),
+                    None => {
+                        // True blocking: context-switch to the next ready process.
+                        if let Some((old, new, pml4, kern_rsp)) =
+                            sched.prepare_block_switch(pid)
+                        {
+                            if let Some(next_pid) = sched.current_process() {
+                                core_kernel::scheduler::CURRENT_PID
+                                    .store(next_pid.as_u32(), Ordering::Relaxed);
+                            }
+                            // Re-arm the LAPIC one-shot so the timer ISR fires in
+                            // one tick to unblock deadline-expired processes.
+                            // Without this, if the one-shot has already fired and
+                            // all processes are blocked, preemption stops entirely
+                            // and the shell never wakes up.
+                            crate::apic::lapic::arm_oneshot(1);
+                            unsafe {
+                                super::tss::set_rsp0(kern_rsp);
+                                // Execution resumes here when this process is
+                                // rescheduled by tick_scheduler_isr.
+                                crate::context::switch_context_noints(old, new, pml4);
+                            }
+                        }
+                    }
                 }
             } else {
-                ENOSYS
+                return ENOSYS;
             }
+            u64::MAX // returned when resumed (or if no next process was ready)
         }
 
         SYS_NOTIFY => {
@@ -372,13 +473,33 @@ extern "C" fn dispatch_syscall(
                         unsafe {
                             core::ptr::write(a1 as *mut core_kernel::ipc::Message, msg);
                         }
-                        0
+                        return 0;
                     }
-                    None => u64::MAX,
+                    None => {
+                        // True blocking: context-switch to the next ready process.
+                        if let Some((old, new, pml4, kern_rsp)) =
+                            sched.prepare_block_switch(pid)
+                        {
+                            if let Some(next_pid) = sched.current_process() {
+                                core_kernel::scheduler::CURRENT_PID
+                                    .store(next_pid.as_u32(), Ordering::Relaxed);
+                            }
+                            // Re-arm the LAPIC one-shot so the timer ISR fires to
+                            // unblock deadline-expired processes.
+                            crate::apic::lapic::arm_oneshot(1);
+                            unsafe {
+                                super::tss::set_rsp0(kern_rsp);
+                                // Execution resumes here when this process is
+                                // rescheduled by tick_scheduler_isr.
+                                crate::context::switch_context_noints(old, new, pml4);
+                            }
+                        }
+                    }
                 }
             } else {
-                ENOSYS
+                return ENOSYS;
             }
+            u64::MAX // returned when resumed (or if no next process was ready)
         }
 
         // SYS_SEND_MSG — send a full Message from a user-provided buffer.
@@ -444,11 +565,17 @@ extern "C" fn dispatch_syscall(
         // a1 = physical address (4 KB-aligned; 0 = allocate a new physical page)
         // a2 = flags            (bit 0 = writable, bit 1 = user-mode accessible)
         //
-        // Returns 0 on success, ENOMEM if physical memory is exhausted, EINVAL
-        // for a misaligned, null, or out-of-user-space address.
+        // Returns 0 on success, ENOMEM if physical memory is exhausted or the
+        // process's memory quota is exceeded, EINVAL for a misaligned, null, or
+        // out-of-user-space address.
         //
         // Security: a0 is validated against USER_VA_END so a process cannot map
         // a page over the kernel's own identity-mapped virtual addresses.
+        //
+        // Quota: the process's memory_quota_pages is checked before allocation.
+        // On success memory_pages_used is incremented so future calls are
+        // counted.  IEC 61508 §7.4.5: each process's physical memory footprint
+        // is bounded by its pre-assigned quota.
         SYS_MAP => {
             use core_kernel::memory::{PTE_PRESENT, PTE_WRITABLE, PTE_USER,
                                       map_page_global, global_alloc_4k,
@@ -456,6 +583,18 @@ extern "C" fn dispatch_syscall(
 
             if !validate_user_vaddr(a0) { return EINVAL; }
             if a1 != 0 && a1 & 0xFFF != 0 { return EINVAL; }
+
+            let sched = match core_kernel::scheduler::get_global() {
+                Some(s) => s,
+                None    => return ENOSYS,
+            };
+            let pid = core_kernel::process::ProcessId::new(
+                core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed));
+
+            // Enforce memory quota before touching the allocator.
+            if !sched.check_memory_quota(pid) {
+                return ENOMEM; // quota exhausted
+            }
 
             let phys = if a1 != 0 {
                 a1
@@ -470,15 +609,9 @@ extern "C" fn dispatch_syscall(
             };
 
             // Find the calling process's PML4.
-            let pml4_phys = if let Some(sched) = core_kernel::scheduler::get_global() {
-                let pid = core_kernel::process::ProcessId::new(
-                    core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed));
-                sched.get_process_pml4(pid)
-                    .unwrap_or_else(|| core_kernel::scheduler::KERNEL_PML4_PHYS
-                        .load(Ordering::Relaxed))
-            } else {
-                return ENOSYS;
-            };
+            let pml4_phys = sched.get_process_pml4(pid)
+                .unwrap_or_else(|| core_kernel::scheduler::KERNEL_PML4_PHYS
+                    .load(Ordering::Relaxed));
 
             // For identity-mapped kernel, pml4_phys == pml4_virt.
             let pml4 = unsafe { &mut *(pml4_phys as *mut core_kernel::memory::PageTable) };
@@ -487,7 +620,13 @@ extern "C" fn dispatch_syscall(
             if a2 & 1 != 0 { flags |= PTE_WRITABLE; }
             if a2 & 2 != 0 { flags |= PTE_USER; }
 
-            if map_page_global(pml4, a0, phys, flags) { 0 } else { ENOMEM }
+            if map_page_global(pml4, a0, phys, flags) {
+                // Mapping succeeded — record the page against the process quota.
+                sched.use_memory_page(pid);
+                0
+            } else {
+                ENOMEM
+            }
         }
 
         // SYS_REGISTER — register the current process as a named service.
@@ -509,13 +648,14 @@ extern "C" fn dispatch_syscall(
         // a0 = pointer to a null-terminated ASCII service name
         //      (must be 16 bytes accessible, 1-byte aligned, within user space)
         //
-        // Returns the PID on success, EINVAL if pointer invalid or name not found.
+        // Returns the PID on success, u64::MAX if not found, EINVAL if
+        // the pointer is invalid.  Callers poll with `!= u64::MAX`.
         SYS_LOOKUP => {
             if !validate_user_ptr(a0, 16, 1) { return EINVAL; }
             let name = unsafe { core::slice::from_raw_parts(a0 as *const u8, 16) };
             match core_kernel::service_registry::lookup(name) {
                 Some(pid) => pid as u64,
-                None      => EINVAL,
+                None      => u64::MAX,  // not yet registered; caller polls
             }
         }
 
@@ -633,6 +773,29 @@ extern "C" fn dispatch_syscall(
             // Send: stamps sender PID, sets caller.waiting_for = Some(to_pid).
             if !sched.send_message(caller, to_pid, msg) {
                 return EAGAIN;
+            }
+
+            // Deadlock detection before blocking.
+            //
+            // send_message has just set caller.waiting_for = Some(to_pid).
+            // If to_pid already (transitively) waits for caller via existing
+            // waiting_for links, blocking would create a cycle that no timer
+            // interrupt can break — a permanent scheduling stall.
+            //
+            // detect_deadlock(caller, to_pid) performs an O(32) DFS from
+            // to_pid; if it reaches caller the cycle is confirmed and we
+            // return EDEADLK so the application can break the deadlock itself
+            // (e.g., by using a timeout or restructuring its call graph).
+            //
+            // IEC 61508 §7.4.4: every blocking operation must have a bounded
+            // wait time.  Cycle detection provides a hard guarantee independent
+            // of application-level timeouts.
+            if sched.detect_deadlock(caller, to_pid) {
+                // The message was already enqueued in to_pid's mailbox.
+                // We cannot unsend it; EDEADLK signals the caller that it
+                // must handle the deadlock (typically: retry with timeout,
+                // or restructure to break the wait cycle).
+                return EDEADLK;
             }
 
             // Block until a reply arrives (or timeout).
@@ -839,6 +1002,11 @@ extern "C" fn dispatch_syscall(
             let caller = core_kernel::process::ProcessId::new(
                 core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed));
 
+            // Enforce memory quota before allocating the frame.
+            if !sched.check_memory_quota(caller) {
+                return ENOMEM; // quota exhausted
+            }
+
             // Allocate and zero a fresh 4 KB frame.
             let frame_phys = match global_alloc_4k() {
                 Some(p) => { frame_tag(p, FrameKind::UserOwned); p }
@@ -857,6 +1025,9 @@ extern "C" fn dispatch_syscall(
                 // Mapping failed (table node alloc OOM); frame is leaked to keep invariants.
                 return ENOMEM;
             }
+
+            // Mapping succeeded — account for the page.
+            sched.use_memory_page(caller);
 
             // Install a Memory capability: object_id = PFN.
             let pfn = (frame_phys >> 12) as u32;
@@ -997,6 +1168,59 @@ extern "C" fn dispatch_syscall(
                 }
             }
             0
+        }
+
+        // SYS_SPAWN_ELF — load and spawn a ring-3 ELF image from user space.
+        //
+        // a0 = pointer to ELF image in caller's address space
+        // a1 = byte length of the ELF image
+        // a2 = priority (0 = default 128; 1–255 = explicit priority)
+        //
+        // The kernel reads the ELF bytes from [a0, a0+a1) (STAC is active),
+        // validates the ELF header, maps all PT_LOAD segments into a fresh PML4,
+        // and creates a new ring-3 process.
+        //
+        // Returns the new PID on success.
+        // Returns EINVAL if the pointer is invalid, the length is 0, the ELF
+        //         header fails validation, or the process table is full.
+        // Returns ENOMEM if physical memory is exhausted during segment mapping.
+        // Returns ENOSYS if the ELF spawn hook is not yet registered.
+        SYS_SPAWN_ELF => {
+            if a1 == 0 { return EINVAL; }
+            if !validate_user_ptr(a0, a1 as usize, 1) { return EINVAL; }
+            match unsafe {
+                core_kernel::elf_spawn::call_elf_spawn(
+                    a0 as *const u8,
+                    a1 as usize,
+                    (a2 & 0xFF) as u8,
+                )
+            } {
+                Some(pid) => pid as u64,
+                None      => EINVAL,
+            }
+        }
+
+        // SYS_RESTART_SERVER — restart a registered server from its embedded ELF.
+        //
+        // a0 = pointer to 16-byte null-padded ASCII service name in user space
+        //
+        // The kernel maps each well-known name ("uart-drv", "rost-vfs",
+        // "rost-shell") to its embedded ELF image and calls spawn_elf with the
+        // original boot priority.  The new PID is returned to the caller.
+        //
+        // Returns the new PID on success.
+        // Returns EINVAL if the pointer is invalid or the name is unknown.
+        // Returns ENOSYS if the restart hook is not yet registered.
+        SYS_RESTART_SERVER => {
+            // Name is at most 16 bytes; 1-byte aligned.
+            const NAME_LEN: usize = 16;
+            if !validate_user_ptr(a0, NAME_LEN, 1) { return EINVAL; }
+            match unsafe {
+                core_kernel::elf_spawn::call_restart_server(a0 as *const u8, NAME_LEN)
+            } {
+                Some(pid) => pid as u64,
+                None      => EINVAL,
+            }
         }
 
         _ => ENOSYS,

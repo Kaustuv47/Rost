@@ -17,11 +17,15 @@ pub mod elf;
 // The build script (scripts/build.sh) compiles the servers/ workspace before
 // this crate, so these paths are valid at kernel compile time.
 //
-// Layout after boot:
-//   PID 1 — kernel idle process (priority 255)
-//   PID 2 — rost-uart-drv  (UART driver; shell sends bytes here)
-//   PID 3 — rost-vfs       (virtual filesystem)
-//   PID 4 — rost-shell     (interactive shell)
+// Boot spawn order (determines PID assignment):
+//   PID 1 — rost-init      (health monitor — MUST be first; fault handler targets PID 1)
+//   PID 2 — kernel idle process (priority 255)
+//   PID 3 — rost-uart-drv  (UART driver; shell sends bytes here)
+//   PID 4 — rost-vfs       (virtual filesystem)
+//   PID 5 — rost-shell     (interactive shell)
+static INIT_ELF: &[u8] = include_bytes!(
+    "../../../servers/target/x86_64-unknown-none/debug/rost-init"
+);
 static UART_DRV_ELF: &[u8] = include_bytes!(
     "../../../servers/target/x86_64-unknown-none/debug/rost-uart-drv"
 );
@@ -136,6 +140,62 @@ extern "C" fn idle_process() -> ! {
         if tick_count % 50 == 0 {
             hal::watchdog::kick();
         }
+    }
+}
+
+// =============================================================================
+// ELF SPAWN HOOK
+// =============================================================================
+
+/// Kernel-side ELF spawn hook registered with `core_kernel::elf_spawn`.
+///
+/// Called by the `SYS_SPAWN_ELF` syscall handler (in `arch-x86_64`) with a
+/// pointer to an ELF image in the calling process's user-space memory.
+/// Returns the new PID on success or `u32::MAX` on any failure.
+///
+/// # Safety
+/// The caller (syscall dispatcher) guarantees:
+///   - `[ptr, ptr + len)` is readable (STAC is active).
+///   - The slice does not alias any active kernel data structures.
+unsafe fn elf_spawn_kernel_hook(ptr: *const u8, len: usize, priority: u8) -> u32 {
+    let data = core::slice::from_raw_parts(ptr, len);
+    match elf::spawn_elf(data, priority) {
+        Some(pid) => pid.as_u32(),
+        None      => u32::MAX,
+    }
+}
+
+/// Kernel-side server restart hook registered with `core_kernel::elf_spawn`.
+///
+/// Called by `SYS_RESTART_SERVER` (27) when init asks the kernel to respawn
+/// a named server.  The kernel already holds the embedded ELF image for every
+/// well-known server, so no user-space buffer is needed.
+///
+/// Name matching uses `starts_with` on the 16-byte user buffer so that both
+/// null-padded ("uart-drv\0\0\0\0\0\0\0\0") and bare ("uart-drv") names work.
+///
+/// # Safety
+/// The caller (syscall dispatcher) guarantees:
+///   - `[name_ptr, name_ptr + 16)` is readable (STAC is active).
+unsafe fn restart_server_hook(name_ptr: *const u8, name_len: usize) -> u32 {
+    let name = core::slice::from_raw_parts(name_ptr, name_len);
+    // Strip trailing null bytes for comparison.
+    let end = name.iter().position(|&b| b == 0).unwrap_or(name_len);
+    let name = &name[..end];
+
+    let (elf_data, priority): (&[u8], u8) = if name == b"uart-drv" {
+        (UART_DRV_ELF, 64)
+    } else if name == b"rost-vfs" {
+        (VFS_ELF, 64)
+    } else if name == b"rost-shell" {
+        (SHELL_ELF, 64)
+    } else {
+        return u32::MAX; // unknown server name
+    };
+
+    match elf::spawn_elf(elf_data, priority) {
+        Some(pid) => pid.as_u32(),
+        None      => u32::MAX,
     }
 }
 
@@ -643,6 +703,19 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
     // LAPIC_EOI_ADDR is set inside lapic::init() so the timer ISR can ACK LAPIC ticks.
     {
         let lapic_base = unsafe { LAPIC_PHYS_ADDR };
+        // The LAPIC MMIO window (4 KB at lapic_base) may not appear in the UEFI
+        // memory map, so the Stage-1 identity-mapping loop may have skipped it.
+        // Explicitly map the page before the first register access; mapping an
+        // already-present entry is a no-op (map_page_global checks PTE_PRESENT).
+        if lapic_base != 0 {
+            let pml4 = unsafe { &mut *core::ptr::addr_of_mut!(KERNEL_PML4) };
+            core_kernel::memory::map_page_global(
+                pml4,
+                lapic_base,
+                lapic_base,
+                core_kernel::memory::PTE_PRESENT | core_kernel::memory::PTE_WRITABLE,
+            );
+        }
         arch_x86_64::apic::lapic::init(lapic_base);
     }
 
@@ -650,6 +723,16 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
     // Individual IRQs can be routed later via apic::ioapic::route_irq().
     {
         let ioapic_base = unsafe { IOAPIC_PHYS_ADDR };
+        // Same reasoning as LAPIC: map the I/O APIC MMIO page on demand.
+        if ioapic_base != 0 {
+            let pml4 = unsafe { &mut *core::ptr::addr_of_mut!(KERNEL_PML4) };
+            core_kernel::memory::map_page_global(
+                pml4,
+                ioapic_base,
+                ioapic_base,
+                core_kernel::memory::PTE_PRESENT | core_kernel::memory::PTE_WRITABLE,
+            );
+        }
         arch_x86_64::apic::ioapic::init(ioapic_base);
     }
 
@@ -657,6 +740,22 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
     // Installs root/context tables so DMA is routed through kernel-controlled
     // structures; per-device restriction will be added in a future patch.
     {
+        // Map all IOMMU MMIO register pages before the driver touches them.
+        {
+            let pml4  = unsafe { &mut *core::ptr::addr_of_mut!(KERNEL_PML4) };
+            let count = unsafe { IOMMU_COUNT };
+            for i in 0..count {
+                let base = unsafe { IOMMU_BASES[i] };
+                if base != 0 {
+                    core_kernel::memory::map_page_global(
+                        pml4,
+                        base,
+                        base,
+                        core_kernel::memory::PTE_PRESENT | core_kernel::memory::PTE_WRITABLE,
+                    );
+                }
+            }
+        }
         let iommu_bases = unsafe { &IOMMU_BASES[..IOMMU_COUNT] };
         let enabled = core_kernel::iommu::init(iommu_bases);
         if enabled > 0 {
@@ -673,6 +772,17 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
     {
         let rsdp_phys = boot_info.acpi.as_ref().map(|a| a.rsdp_address).unwrap_or(0);
         if let Some(hpet_phys) = core_kernel::acpi::find_hpet(rsdp_phys) {
+            // Map the HPET MMIO page BEFORE parse_hpet() reads the live GCI
+            // register (parse_hpet reads MMIO to extract the counter period).
+            if let Some(hpet_mmio) = core_kernel::acpi::hpet_mmio_base(hpet_phys) {
+                let pml4 = unsafe { &mut *core::ptr::addr_of_mut!(KERNEL_PML4) };
+                core_kernel::memory::map_page_global(
+                    pml4,
+                    hpet_mmio,
+                    hpet_mmio,
+                    core_kernel::memory::PTE_PRESENT | core_kernel::memory::PTE_WRITABLE,
+                );
+            }
             if let Some(hpet) = core_kernel::acpi::parse_hpet(hpet_phys) {
                 core_kernel::hpet::init(&hpet);
                 hal::uart::print_str("      ├─ HPET:            enabled, period=");
@@ -718,20 +828,43 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
 
     let sched = core_kernel::scheduler::Scheduler::new();
 
-    // Idle process — priority 255, runs only when no other process is Ready.
-    let idle_pid = sched.add_process(idle_process as *const () as u64, 0, kernel_pml4_phys);
-    if let Some(idle) = idle_pid {
-        sched.set_priority(idle, 255);
-    }
-
-    // Move the scheduler into the global slot before loading ELF binaries,
-    // because spawn_elf() calls get_global() internally.
+    // Move the scheduler into the global slot FIRST (empty — no processes yet),
+    // so all spawn_elf() calls below can use get_global() internally.
     core_kernel::scheduler::init_global(sched);
+
+    // Register the ELF spawn hook so that SYS_SPAWN_ELF (26) from ring-3
+    // can call into the kernel ELF loader without creating a circular
+    // dependency between arch-x86_64 and the kernel crate.
+    //
+    // SAFETY: elf_spawn_kernel_hook / restart_server_hook are well-typed
+    // function pointers; STAC is active in the syscall handler.
+    core_kernel::elf_spawn::set_elf_spawn_fn(elf_spawn_kernel_hook);
+    core_kernel::elf_spawn::set_restart_server_fn(restart_server_hook);
 
     // ── Launch ring-3 servers from embedded ELF images ────────────────────────
     //
-    // Boot order matters: uart-drv must be PID 2 so the shell finds it.
-    // We spawn in dependency order; each server registers its name on startup.
+    // Spawn order determines PID assignment.  init MUST be first so the kernel
+    // fault handler's hardcoded `ProcessId::new(1)` target resolves to init.
+    //
+    // Spawn order: init(PID1) → idle(PID2) → uart-drv(PID3) → vfs(PID4) → shell(PID5).
+
+    hal::uart::print_str("      └─ Spawning init (PID 1)...\n");
+    let init_pid = elf::spawn_elf(INIT_ELF, 32); // priority 32: health monitor
+    if init_pid.is_none() {
+        hal::uart::print_str("      [WARN] init ELF load failed\n");
+    }
+
+    // Idle process — priority 255, runs only when no other process is Ready.
+    // Added after init so idle does NOT steal PID 1.
+    let idle_pid = if let Some(sched) = core_kernel::scheduler::get_global() {
+        let idle = sched.add_process(idle_process as *const () as u64, 0, kernel_pml4_phys);
+        if let Some(idle) = idle {
+            sched.set_priority(idle, 255);
+        }
+        idle
+    } else {
+        None
+    };
 
     hal::uart::print_str("      └─ Spawning uart-drv...\n");
     let uart_pid = elf::spawn_elf(UART_DRV_ELF, 64);
@@ -746,20 +879,34 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
     }
 
     hal::uart::print_str("      └─ Spawning rost-shell...\n");
-    let shell_pid = elf::spawn_elf(SHELL_ELF, 128);
+    let shell_pid = elf::spawn_elf(SHELL_ELF, 64);
     if shell_pid.is_none() {
         hal::uart::print_str("      [WARN] shell ELF load failed\n");
     }
 
-    // Set TSS.RSP0 and CURRENT_PID to the idle process so that the first
-    // timer tick can switch away from it to uart-drv / shell.
+    // Set TSS.RSP0, CURRENT_PID, and the scheduler's internal current_process
+    // to the idle process so that the first timer tick advances idle's cpu_time
+    // and preempts it in favour of init / uart-drv / shell.
+    //
+    // CRITICAL: both the global atomic CURRENT_PID *and* the scheduler's own
+    // current_process RefCell must point to idle.  timer_tick() reads only the
+    // scheduler's RefCell — if it is None, preempt is never set to true and
+    // no context switch ever fires (all processes starve forever).
     if let Some(idle) = idle_pid {
         core_kernel::scheduler::CURRENT_PID
             .store(idle.as_u32(), core::sync::atomic::Ordering::Relaxed);
+        if let Some(sched) = core_kernel::scheduler::get_global() {
+            sched.set_current(idle);
+        }
     }
 
     hal::uart::print_str("      └─ Algorithm:       Priority (lowest num = highest prio)\n");
     hal::uart::print_str("      └─ Time quantum:    10 ms\n");
+    hal::uart::print_str("      └─ init (PID 1):   PID ");
+    if let Some(p) = init_pid {
+        hal::uart::print_hex(p.as_u32() as u64);
+        hal::uart::print_str(" (priority 32 — health monitor)\n");
+    }
     hal::uart::print_str("      └─ Idle process:    PID ");
     if let Some(p) = idle_pid {
         hal::uart::print_hex(p.as_u32() as u64);
@@ -797,6 +944,27 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
     hal::uart::print_str("║        KERNEL INITIALIZATION      ║\n");
     hal::uart::print_str("║             COMPLETE              ║\n");
     hal::uart::print_str("╚════════════════════════════════════╝\n\n");
+
+    // Verify init's kernel stack is mapped in the kernel PML4 before enabling interrupts.
+    if let Some(sched) = core_kernel::scheduler::get_global() {
+        let init_pid = core_kernel::process::ProcessId::new(1);
+        if let Some((ctx_rsp, kern_rsp)) = sched.get_ctx_rsp(init_pid) {
+            let page = ctx_rsp & !0xFFF;
+            let phys = core_kernel::memory::translate_address(kernel_pml4, page);
+            hal::uart::print_str("[DBG] init ctx.rsp=");
+            hal::uart::print_hex(ctx_rsp);
+            hal::uart::print_str(" kern_rsp=");
+            hal::uart::print_hex(kern_rsp);
+            hal::uart::print_str(" stack_page=");
+            hal::uart::print_hex(page);
+            hal::uart::print_str(" mapped=");
+            match phys {
+                Some(p) => hal::uart::print_hex(p),
+                None    => hal::uart::print_str("UNMAPPED!"),
+            }
+            hal::uart::print_str("\n");
+        }
+    }
 
     arch_x86_64::cpu::enable_interrupts();
     hal::uart::print_str("✓ Interrupts enabled — ring-3 servers running\n\n");

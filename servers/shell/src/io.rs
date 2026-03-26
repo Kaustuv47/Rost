@@ -1,67 +1,48 @@
 //! Terminal I/O for the shell server.
 //!
-//! All reads and writes go through the UART driver server via IPC.
-//! The uart-drv server (servers/uart-drv) owns COM1 and forwards
-//! keystrokes to us as IPC messages.
+//! **Output**: `put_byte` / `print_str` call `SYS_UART_WRITE` (syscall 12)
+//! directly.  This bypasses the uart-drv IPC queue, eliminating queue-overflow
+//! byte loss when the shell emits the banner or redraws the prompt.
 //!
-//! # Protocol with uart-drv
-//!
-//! **Write a byte**
-//! ```text
-//!   SYS_SEND(uart_drv_pid, OP_WRITE=0x01, byte_value)
-//! ```
-//!
-//! **Read a byte** (non-blocking)
-//! ```text
-//!   SYS_RECV(timeout=0)
-//!   → u64::MAX  : no byte available
-//!   → byte value: LSB of returned word
-//! ```
-//!
-//! **Read a byte** (blocking)
-//! ```text
-//!   SYS_RECV(timeout=u64::MAX)
-//!   → byte value when uart-drv pushes a keystroke to our mailbox
-//! ```
+//! **Input**: keystrokes arrive as IPC messages sent by uart-drv
+//! (`SYS_SEND(shell_pid, byte, 0)`).  `read_byte` polls via `SYS_RECV`
+//! (timeout=0); `read_byte_blocking` blocks until a byte arrives.
 
-/// IPC opcode: write one byte to the terminal.
-const OP_WRITE: u64 = 0x01;
-
-/// Service name used to locate uart-drv at runtime.
-const UART_DRV_NAME: &[u8] = b"uart-drv\0";
-
-/// Lazily resolved PID of the uart-drv server.
+/// Write one byte to the terminal.
 ///
-/// Initialised on the first call to `uart_drv_pid()`, then cached.
-static mut UART_DRV_PID: u64 = u64::MAX;
-
-/// Returns the current PID of the uart-drv server, resolving it if needed.
-fn uart_drv_pid() -> u64 {
-    // Safety: single-threaded ring-3 process; no concurrent modification.
-    unsafe {
-        if UART_DRV_PID == u64::MAX {
-            loop {
-                let pid = crate::syscall::lookup(UART_DRV_NAME);
-                if pid != u64::MAX {
-                    UART_DRV_PID = pid;
-                    break;
-                }
-                crate::syscall::yield_cpu();
-            }
-        }
-        UART_DRV_PID
-    }
+/// Uses `SYS_UART_WRITE` (syscall 12) to write directly to COM1 via the
+/// kernel, bypassing the uart-drv IPC queue.  This prevents queue-overflow
+/// byte loss when the shell prints the banner or redraws the prompt (both
+/// of which emit far more than the 16-message queue depth in one burst).
+///
+/// Input (keystrokes) still flows uart-drv → SYS_SEND → shell IPC queue,
+/// read back via `read_byte()` / `read_byte_blocking()`.
+///
+/// No CR/LF translation.  Use `put_newline()` for a proper line break.
+pub fn put_byte(b: u8) {
+    crate::syscall::uart_write(b);
 }
 
-/// Write one byte to the terminal via uart-drv.
-pub fn put_byte(b: u8) {
-    crate::syscall::send(uart_drv_pid(), OP_WRITE, b as u64);
+/// Emit a proper newline: CR (\r) then LF (\n).
+///
+/// The UART layer does no translation, so callers must use this instead of
+/// `put_byte(b'\n')` whenever a visible line break is needed.
+pub fn put_newline() {
+    crate::syscall::uart_write(b'\r');
+    crate::syscall::uart_write(b'\n');
 }
 
 /// Write a string slice to the terminal.
+///
+/// Every `\n` in the string is sent as `\r\n` so that the terminal moves to
+/// the start of the next line.
 pub fn print_str(s: &str) {
     for b in s.bytes() {
-        put_byte(b);
+        if b == b'\n' {
+            put_newline();
+        } else {
+            put_byte(b);
+        }
     }
 }
 

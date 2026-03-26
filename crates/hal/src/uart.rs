@@ -10,12 +10,12 @@ unsafe fn inb(port: u16) -> u8 {
     v
 }
 
-/// Initialize COM1 at 38400 baud, 8N1
+/// Initialize COM1 at 115200 baud, 8N1
 pub fn init() {
     unsafe {
         outb(COM1 + 1, 0x00); // Disable interrupts
         outb(COM1 + 3, 0x80); // Enable DLAB
-        outb(COM1 + 0, 0x03); // Baud divisor low  (38400)
+        outb(COM1 + 0, 0x01); // Baud divisor low  (115200)
         outb(COM1 + 1, 0x00); // Baud divisor high
         outb(COM1 + 3, 0x03); // 8 bits, no parity, 1 stop bit
         outb(COM1 + 2, 0xC7); // Enable + clear FIFO
@@ -23,11 +23,14 @@ pub fn init() {
     }
 }
 
-/// Transmit one byte; auto-appends CR after LF.
+/// Transmit one byte to COM1.
 ///
 /// Waits for the UART Transmit Holding Register Empty (THRE) bit before
 /// writing.  Bounded to `UART_TIMEOUT` iterations so a broken or absent
 /// UART does not hang the kernel (IEC 61508 §7.4.1 liveness).
+///
+/// No CR/LF translation is performed here — callers must send explicit
+/// `\r\n` sequences when a new line is needed.
 pub fn put_byte(byte: u8) {
     // ~1 M iterations ≈ 1 ms at typical bus speeds; more than enough for
     // a 38400-baud UART whose byte time is ~260 µs.
@@ -39,14 +42,6 @@ pub fn put_byte(byte: u8) {
             if t == 0 { return; }
         }
         outb(COM1, byte);
-        if byte == b'\n' {
-            t = UART_TIMEOUT;
-            while inb(COM1 + 5) & 0x20 == 0 {
-                t -= 1;
-                if t == 0 { return; }
-            }
-            outb(COM1, b'\r');
-        }
     }
 }
 
