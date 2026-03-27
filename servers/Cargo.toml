@@ -1,5 +1,5 @@
 [workspace]
-members = ["shell", "uart-drv", "vfs"]
+members = ["hello-world", "init", "shell", "uart-drv", "vfs"]
 resolver = "2"
 
 # Servers are standalone ring-3 ELF binaries.

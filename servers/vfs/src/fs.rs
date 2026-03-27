@@ -123,17 +123,30 @@ Next steps: ELF loader, block driver, uart-drv server.\n", 0);
 static F_NOTES: Node = Node::file(b"\
 Remaining work\n\
 ==============\n\
-[ ] ELF loader (SYS_MAP + SYS_SPAWN kernel syscalls)\n\
-[ ] uart-drv server (currently assumed PID 2, not yet running)\n\
-[ ] block-drv server (virtio-blk / IDE port-I/O)\n\
+[x] ELF loader (SYS_SPAWN_ELF = 26 - loads ELF from user buffer)\n\
+[x] uart-drv server (PID 3, ring-3, owns COM1 port I/O via SYS_IOPORT)\n\
+[x] VFS RAM-disk server (PID 4, IPC: READDIR / READ / STAT / MOUNT)\n\
+[x] service registry (SYS_REGISTER = 10, SYS_LOOKUP = 11)\n\
+[x] SYS_SPAWN_ELF (26): spawn ring-3 ELF from user buffer\n\
+[x] SYS_RESTART_SERVER (27): re-spawn named server via init (PID 1)\n\
+[x] SYS_LIST_PROCS (28): snapshot process table for ps command\n\
+[x] init server (PID 1): heartbeat watchdog + fault/restart handling\n\
+[x] hello-world demo ELF at /bin/hello (exec /bin/hello to test)\n\
+[ ] block-drv server (virtio-blk or IDE port-I/O)\n\
 [ ] FAT32 parser on top of block-drv\n\
-[ ] service registry (name -> PID lookup, replace hardcoded PIDs)\n\
-[ ] SYS_MAP: map physical pages into a process address space\n\
-[ ] SYS_SPAWN: create a new process from an entry point\n\
-[ ] True preemptive ISR scheduling (currently deferred at hlt boundaries)\n", 0);
+[ ] True preemptive ISR scheduling (currently deferred at hlt boundaries)\n\
+[ ] SYS_MAP: map physical frames into an arbitrary process address space\n", 0);
 
-// ELF magic header — placeholder until a real binary is loaded.
-static F_HELLO: Node = Node::file(b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00", 0x02);
+// hello-world demo ELF — compiled from servers/hello-world.
+// Prints "[hello-world] Hello from ring-3!" to the serial console and exits.
+// Built by scripts/build.sh before the VFS crate is compiled.
+static F_HELLO: Node = Node::file(
+    include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../target/x86_64-unknown-none/debug/hello-world"
+    )),
+    0x02,
+);
 
 // ── Directory structure ───────────────────────────────────────────────────────
 // Leaf directories first so parent statics can reference them.

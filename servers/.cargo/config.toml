@@ -7,4 +7,5 @@ target = "x86_64-unknown-none"
 rustflags = [
     "-C", "link-arg=-nostdlib",
     "-C", "no-redzone",
+    "-C", "relocation-model=static",
 ]

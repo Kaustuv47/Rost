@@ -200,16 +200,27 @@ pub fn tick_scheduler_isr() {
                 core_kernel::scheduler::CURRENT_PID
                     .store(pid.as_u32(), core::sync::atomic::Ordering::Relaxed);
             }
+            // Re-arm the LAPIC one-shot timer BEFORE switching context.
+            //
+            // switch_context_noints may `ret` into ring3_entry_trampoline for a
+            // brand-new ring-3 process; that function issues `iretq` directly to
+            // user space and never returns here.  If arm_oneshot were called
+            // after switch_context_noints (as it was before), the LAPIC one-shot
+            // timer would never be re-programmed on that path and no further
+            // timer interrupts would fire — permanently killing preemption.
+            //
+            // Always fire every 1 tick (10ms) regardless of blocked deadlines.
+            // Using ticks_until_next_event() here caused 500ms stalls: when init
+            // blocks for 50 ticks, that function returns 50 and arm_oneshot(50)
+            // starves Ready processes (uart-drv, shell) for 490ms.
+            crate::apic::lapic::arm_oneshot(1);
             unsafe {
                 tss::set_rsp0(kernel_rsp);
                 crate::context::switch_context_noints(old, new, pml4);
             }
+        } else {
+            // No context switch — still need to re-arm for the next tick.
+            crate::apic::lapic::arm_oneshot(1);
         }
-        // Re-arm the LAPIC one-shot timer for the next event.
-        // In one-shot mode the LAPIC does not restart automatically; we must
-        // write a new ICR here so the next interrupt fires at the right time.
-        // arm_oneshot() is a no-op if the LAPIC has not been initialised.
-        let ticks = sched.ticks_until_next_event();
-        crate::apic::lapic::arm_oneshot(ticks);
     }
 }

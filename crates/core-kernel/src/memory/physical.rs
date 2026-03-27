@@ -51,7 +51,7 @@ fn bitmap_clear(idx: usize) {
 #[inline]
 fn bitmap_find_free() -> Option<usize> {
     // Safety: single-core, IF=0 on hot path.
-    for (wi, &word) in unsafe { FREE_BITMAP.iter().enumerate() } {
+    for (wi, &word) in unsafe { (core::ptr::addr_of!(FREE_BITMAP) as *const [u64; 1024]).as_ref().unwrap().iter().enumerate() } {
         if word != 0 {
             return Some(wi * 64 + word.trailing_zeros() as usize);
         }

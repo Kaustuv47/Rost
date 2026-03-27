@@ -15,7 +15,7 @@
 /// monitor to force a transition to the safe state (power-off / warm reset)
 /// without relying on the hardware watchdog alone.
 
-use super::{checksum_valid, read_u8, read_u16, read_u32, read_u64};
+use super::{checksum_valid, read_u8, read_u32, read_u64};
 
 // ── FADT field offsets (ACPI 6.5 §5.2.9) ─────────────────────────────────────
 
@@ -34,8 +34,11 @@ const FLAG_RESET_REG_SUP:  u32 = 1 << 10; // RESET_REG field is valid (ACPI ≥ 
 
 // RESET_REG — Generic Address Structure (GAS, 12 bytes) at offset 116
 const FADT_OFF_RESET_GAS_SPACE:  usize = 116; // u8  — address space id
+#[allow(dead_code)]
 const FADT_OFF_RESET_GAS_BW:     usize = 117; // u8  — register bit width
+#[allow(dead_code)]
 const FADT_OFF_RESET_GAS_BOFF:   usize = 118; // u8  — register bit offset
+#[allow(dead_code)]
 const FADT_OFF_RESET_GAS_SIZE:   usize = 119; // u8  — access size
 const FADT_OFF_RESET_GAS_ADDR:   usize = 120; // u64 — address (I/O port or MMIO)
 const FADT_OFF_RESET_VALUE:      usize = 128; // u8  — value to write to RESET_REG

@@ -52,6 +52,7 @@
 /// | 25 | sys_inject_fault    | (fault-injection feature only) Trigger CPU exception for testing |
 /// | 26 | sys_spawn_elf       | Load ring-3 ELF image from user buffer and spawn a new process |
 /// | 27 | sys_restart_server  | Restart a named server using the kernel's embedded ELF image |
+/// | 28 | sys_list_procs      | Snapshot process table into user buffer (24 bytes/entry) |
 use super::{rdmsr, wrmsr};
 
 // MSR addresses
@@ -90,6 +91,7 @@ const SYS_LOOKUP_CAP:  u64 = 24; // lookup service name → Channel capability s
 const SYS_INJECT_FAULT: u64 = 25; // trigger CPU exception for handler-path testing
 const SYS_SPAWN_ELF:       u64 = 26; // load ring-3 ELF from user buffer + spawn process
 const SYS_RESTART_SERVER:  u64 = 27; // restart a named server via kernel-embedded ELF
+const SYS_LIST_PROCS:      u64 = 28; // list active processes → user buffer (a0=ptr, a1=cap)
 
 // Error codes
 const ENOSYS:    u64 = u64::MAX;      // -1: function not implemented
@@ -1221,6 +1223,54 @@ extern "sysv64" fn dispatch_syscall(
                 Some(pid) => pid as u64,
                 None      => EINVAL,
             }
+        }
+
+        // SYS_LIST_PROCS — snapshot the process table into a user buffer.
+        //
+        // a0 = pointer to a buffer in user space
+        // a1 = buffer capacity in entries (each entry = 24 bytes)
+        //
+        // Entry layout (24 bytes, host-endian):
+        //   bytes 0–3   : pid       (u32)
+        //   byte  4     : state_u8  (0=Ready/Running, 1=Blocked, 2=Terminated)
+        //   byte  5     : priority  (u8, 0=highest)
+        //   bytes 6–7   : pad       ([u8; 2])
+        //   bytes 8–23  : name      ([u8; 16], null-padded, from service registry)
+        //
+        // Returns the number of entries written.
+        // Returns EINVAL if `a0` is not a valid user pointer.
+        // Returns ENOSYS if no scheduler is active.
+        SYS_LIST_PROCS => {
+            const ENTRY_SIZE: usize = 24;
+            let capacity = (a1 as usize).min(32);
+            if !validate_user_ptr(a0, ENTRY_SIZE * capacity, 4) { return EINVAL; }
+
+            let sched = match core_kernel::scheduler::get_global() {
+                Some(s) => s,
+                None    => return ENOSYS,
+            };
+
+            let list = sched.list_processes();
+            let count = list.len().min(capacity);
+
+            for i in 0..count {
+                let (pid, state_u8, priority) = list[i];
+                let name = core_kernel::service_registry::lookup_by_pid(pid.as_u32());
+                let entry_ptr = (a0 + (i * ENTRY_SIZE) as u64) as *mut u8;
+                unsafe {
+                    // pid (4 bytes)
+                    core::ptr::write_unaligned(entry_ptr as *mut u32, pid.as_u32());
+                    // state + priority (2 bytes)
+                    core::ptr::write(entry_ptr.add(4), state_u8);
+                    core::ptr::write(entry_ptr.add(5), priority);
+                    // pad (2 bytes)
+                    core::ptr::write(entry_ptr.add(6), 0u8);
+                    core::ptr::write(entry_ptr.add(7), 0u8);
+                    // name (16 bytes)
+                    core::ptr::copy_nonoverlapping(name.as_ptr(), entry_ptr.add(8), 16);
+                }
+            }
+            count as u64
         }
 
         _ => ENOSYS,

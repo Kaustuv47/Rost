@@ -50,6 +50,7 @@ const REG_TIMER_DCR:  usize = 0x3E0;
 /// LVT mask bit — set to suppress delivery of the corresponding interrupt.
 const LVT_MASK: u32 = 1 << 16;
 /// LVT Timer: periodic mode (bits[17:16] = 01).
+#[allow(dead_code)]
 const LVT_TIMER_PERIODIC: u32 = 1 << 17;
 
 // ── MMIO helpers ─────────────────────────────────────────────────────────────
@@ -133,9 +134,10 @@ unsafe fn calibrate_lapic_timer_10ms(lapic_base: u64) -> u32 {
 
     // ── Wait for PIT channel 2 output to go HIGH (bit 5 of port 0x61) ────────
     // Mode 0 OUT starts LOW and transitions HIGH when the counter reaches 0.
-    // Timeout after ~50 M iterations (~50 ms at 1 GHz bus) so a broken or
-    // absent PIT channel 2 does not hang the kernel (IEC 61508 §7.4.1 liveness).
-    let mut timeout = 50_000_000u32;
+    // Timeout after 100 K iterations (~1–2 s at ~10 µs/inb under QEMU/HVF).
+    // PIT ch2 is not reliably emulated in HVF; the fallback ICR handles that.
+    // (IEC 61508 §7.4.1 liveness — bound all busy-waits.)
+    let mut timeout = 100_000u32;
     while inb(0x61) & 0x20 == 0 {
         timeout -= 1;
         if timeout == 0 { return 0; } // calibration failed — caller uses fallback ICR

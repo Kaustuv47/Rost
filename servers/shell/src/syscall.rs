@@ -343,6 +343,86 @@ pub fn cap_grant(slot_idx: usize, to_pid: u32) -> Result<usize, u64> {
     if ret < 256 { Ok(ret as usize) } else { Err(ret) }
 }
 
+/// Write one byte directly to COM1 via the kernel UART syscall.
+///
+/// Bypasses the uart-drv IPC queue so the shell can output without
+/// suffering queue-overflow byte loss during burst writes (e.g. the
+/// initial banner and prompt).  The kernel serialises port I/O so
+/// there is no race with uart-drv's own SYS_UART_WRITE calls.
+#[inline]
+pub fn uart_write(byte: u8) {
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax")  12u64,
+            in("rdi")  byte as u64,
+            lateout("rax") _,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+}
+
+/// Load and spawn a ring-3 ELF process from `elf_buf`.
+///
+/// The kernel reads the ELF bytes from `elf_buf`, maps all PT_LOAD segments
+/// into a fresh address space, and schedules the process at `priority`.
+///
+/// `priority = 0` uses the default (128).
+///
+/// Returns `Some(new_pid)` on success, `None` if the ELF is invalid, the
+/// process table is full, or physical memory is exhausted.
+#[inline]
+pub fn spawn_elf(elf_buf: &[u8], priority: u8) -> Option<u32> {
+    if elf_buf.is_empty() { return None; }
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax")      26u64,
+            in("rdi")      elf_buf.as_ptr() as u64,
+            in("rsi")      elf_buf.len()    as u64,
+            in("rdx")      priority         as u64,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    // EINVAL = u64::MAX-1, ENOSYS = u64::MAX — both map to None.
+    if ret >= u64::MAX - 7 { None } else { Some(ret as u32) }
+}
+
+/// Snapshot the kernel process table into `buf`.
+///
+/// Each entry is 24 bytes:
+///   bytes 0–3  : pid (u32)
+///   byte  4    : state (0=Ready/Running, 1=Blocked, 2=Terminated)
+///   byte  5    : priority (u8)
+///   bytes 6–7  : pad
+///   bytes 8–23 : name (16 bytes, null-padded, from service registry)
+///
+/// Returns the number of entries written (≤ `buf.len() / 24`).
+/// Returns 0 if the scheduler is not yet active or the buffer is too small.
+#[inline]
+pub fn list_procs(buf: &mut [u8; 24 * 32]) -> usize {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax")      28u64,
+            in("rdi")      buf.as_mut_ptr() as u64,
+            in("rsi")      32u64,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    if ret >= u64::MAX - 7 { 0 } else { ret as usize }
+}
+
 /// Set resource quotas for `pid` (0 = calling process).
 ///
 /// All zero values mean "unlimited" for that field:

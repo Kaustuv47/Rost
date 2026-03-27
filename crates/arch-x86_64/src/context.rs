@@ -12,6 +12,12 @@
 /// `rsp` and executing `ret` resumes the process at the instruction after the
 /// original `call`.
 ///
+/// # Calling convention
+///
+/// The kernel binary targets `x86_64-unknown-uefi` which uses the **Windows
+/// x64 ABI** (Microsoft calling convention).  Function arguments are passed
+/// in `rcx`, `rdx`, `r8`, `r9` — NOT the System V `rdi`, `rsi`, `rdx`.
+///
 /// # TaskContext field offsets (must match `core_kernel::process::pcb::TaskContext`)
 /// ```text
 ///  rbx  =  0    rbp  =  8    r12 = 16    r13 = 24    r14 = 32    r15 = 40
@@ -63,35 +69,35 @@ pub unsafe extern "C" fn switch_context(
     new:      *const TaskContext,
     new_pml4: u64,
 ) {
-    // System V AMD64 ABI: rdi = old, rsi = new, rdx = new_pml4
+    // Windows x64 ABI: rcx = old, rdx = new, r8 = new_pml4
     core::arch::naked_asm!(
         "cli",                        // no interrupts during switch
 
         // ── Save callee-saved registers and rsp into old context ─────────────
-        "mov  [rdi +   0], rbx",
-        "mov  [rdi +   8], rbp",
-        "mov  [rdi +  16], r12",
-        "mov  [rdi +  24], r13",
-        "mov  [rdi +  32], r14",
-        "mov  [rdi +  40], r15",
+        "mov  [rcx +   0], rbx",
+        "mov  [rcx +   8], rbp",
+        "mov  [rcx +  16], r12",
+        "mov  [rcx +  24], r13",
+        "mov  [rcx +  32], r14",
+        "mov  [rcx +  40], r15",
         // rsp: the return address of this call is already at [rsp]
-        "mov  [rdi + 120], rsp",
+        "mov  [rcx + 120], rsp",
 
         // ── Restore callee-saved registers and rsp from new context ──────────
-        // (rdx still holds new_pml4 — the restore does not touch it)
-        "mov  rbx, [rsi +   0]",
-        "mov  rbp, [rsi +   8]",
-        "mov  r12, [rsi +  16]",
-        "mov  r13, [rsi +  24]",
-        "mov  r14, [rsi +  32]",
-        "mov  r15, [rsi +  40]",
-        "mov  rsp, [rsi + 120]",      // switch to new stack
+        // (r8 still holds new_pml4 — the restore does not touch it)
+        "mov  rbx, [rdx +   0]",
+        "mov  rbp, [rdx +   8]",
+        "mov  r12, [rdx +  16]",
+        "mov  r13, [rdx +  24]",
+        "mov  r14, [rdx +  32]",
+        "mov  r15, [rdx +  40]",
+        "mov  rsp, [rdx + 120]",      // switch to new stack
 
         // ── Conditionally switch address space ───────────────────────────────
         // Skip CR3 write when new_pml4 == 0 (same address space).
-        "test rdx, rdx",
+        "test r8, r8",
         "jz   2f",
-        "mov  cr3, rdx",              // flush TLB + load new PML4
+        "mov  cr3, r8",               // flush TLB + load new PML4
         "2:",
 
         "sti",                        // re-enable interrupts
@@ -125,6 +131,7 @@ pub unsafe extern "C" fn switch_context(
 pub unsafe extern "C" fn ring3_entry_trampoline() {
     core::arch::naked_asm!(
         // r12 = user RIP,  r13 = user RSP  (set by ProcessControlBlock::new_ring3)
+        // RSP = kern_stack_top - 8 when we arrive here via `ret`.
         "push 0x1B",                          // SS  = ring-3 data (0x18 | 3)
         "push r13",                           // RSP = user stack top
         "pushfq",                             // RFLAGS
@@ -149,27 +156,39 @@ pub unsafe extern "C" fn switch_context_noints(
     new:      *const TaskContext,
     new_pml4: u64,
 ) {
+    // Windows x64 ABI: rcx = old, rdx = new, r8 = new_pml4
+    //
+    // We save `new` (rdx) into r9 immediately because cli and later code must
+    // not clobber rdx before we finish loading the new context.  r9 is a
+    // caller-saved (volatile) register so it is safe to use as a scratch here.
     core::arch::naked_asm!(
-        "cli",
-        "mov  [rdi +   0], rbx",
-        "mov  [rdi +   8], rbp",
-        "mov  [rdi +  16], r12",
-        "mov  [rdi +  24], r13",
-        "mov  [rdi +  32], r14",
-        "mov  [rdi +  40], r15",
-        "mov  [rdi + 120], rsp",
-        "mov  rbx, [rsi +   0]",
-        "mov  rbp, [rsi +   8]",
-        "mov  r12, [rsi +  16]",
-        "mov  r13, [rsi +  24]",
-        "mov  r14, [rsi +  32]",
-        "mov  r15, [rsi +  40]",
-        "mov  rsp, [rsi + 120]",
-        "test rdx, rdx",
+        "mov  r9, rdx",               // r9 = new (preserve before any rdx use)
+        "cli",                        // no interrupts during switch
+
+        // ── Save callee-saved registers and rsp into old context ─────────────
+        "mov  [rcx +   0], rbx",
+        "mov  [rcx +   8], rbp",
+        "mov  [rcx +  16], r12",
+        "mov  [rcx +  24], r13",
+        "mov  [rcx +  32], r14",
+        "mov  [rcx +  40], r15",
+        "mov  [rcx + 120], rsp",
+
+        // ── Restore callee-saved registers and rsp from new context ──────────
+        "mov  rbx, [r9 +   0]",
+        "mov  rbp, [r9 +   8]",
+        "mov  r12, [r9 +  16]",
+        "mov  r13, [r9 +  24]",
+        "mov  r14, [r9 +  32]",
+        "mov  r15, [r9 +  40]",
+        "mov  rsp, [r9 + 120]",       // switch to new stack
+
+        // ── Conditionally switch address space ───────────────────────────────
+        "test r8, r8",
         "jz   2f",
-        "mov  cr3, rdx",
+        "mov  cr3, r8",               // flush TLB + load new PML4
         "2:",
-        // No sti — IRETQ in the ISR stub restores RFLAGS (and therefore IF).
-        "ret",
+
+        "ret",                        // pop return address from new stack → jump
     );
 }

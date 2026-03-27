@@ -34,11 +34,12 @@
 ///   +0x20  RTADDR  — root table address (bits[63:12] = root table phys >> 12)
 /// ```
 
-use crate::memory::{global_alloc_4k, PTE_ADDR_MASK};
+use crate::memory::global_alloc_4k;
 
 // ── IOMMU register offsets ────────────────────────────────────────────────────
 
 const OFF_VER:    usize = 0x00;
+#[allow(dead_code)]
 const OFF_CAP:    usize = 0x08;
 const OFF_ECAP:   usize = 0x10;
 const OFF_GCMD:   usize = 0x18;

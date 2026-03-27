@@ -1,5 +1,13 @@
 //! Raw syscall wrappers for the VFS server.
 //! Identical calling convention to servers/shell/src/syscall.rs.
+//!
+//! | # | Name      | Used |
+//! |---|-----------|------|
+//! | 1 | exit      | ✓ panic handler |
+//! | 5 | notify    | ✓ signal init on startup / panic |
+//! | 6 | recv_msg  | ✓ main dispatch loop |
+//! | 7 | send_msg  | ✓ IPC responses |
+//! |10 | register  | ✓ register as "rost-vfs" |
 
 /// IPC message — must match core_kernel::ipc::Message layout exactly:
 ///   offset 0: sender u32   (4 bytes)
@@ -68,6 +76,25 @@ pub fn recv_msg(timeout_ticks: u64, buf: &mut Msg) -> bool {
         );
     }
     ret != u64::MAX
+}
+
+/// Register the calling process under `name` in the kernel service registry.
+/// `name` must be a null-terminated ASCII slice padded to 16 bytes.
+#[inline]
+pub fn register(name: &[u8]) -> bool {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax")      10u64,
+            in("rdi")      name.as_ptr() as u64,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret == 0
 }
 
 /// Send a full Message.  The kernel overwrites msg.sender with our PID.

@@ -34,6 +34,10 @@ static MOUNTS: &[MountPoint] = &[
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // Register so SYS_LOOKUP("rost-vfs") resolves to our PID.
+    // Required by: init (heartbeat tracking) and shell (VFS IPC).
+    syscall::register(b"rost-vfs\0\0\0\0\0\0\0\0");
+
     // Signal init (PID 1) that the VFS is ready.
     syscall::notify(1, 0x5246_5342_5f52_4459); // "RFSB_RDY"
     dispatch_loop()

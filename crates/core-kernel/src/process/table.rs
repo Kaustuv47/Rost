@@ -163,6 +163,25 @@ impl ProcessTable {
         }
     }
 
+    /// Return `(ProcessId, state_u8, priority)` for every non-`None` slot.
+    ///
+    /// `state_u8` encoding: 0 = Ready/Running, 1 = Blocked, 2 = Terminated.
+    /// Used by `SYS_LIST_PROCS` to snapshot the process list for `ps`.
+    pub fn list_all(&self) -> ProcList<(ProcessId, u8, u8)> {
+        let mut out = ProcList::new();
+        for s in self.processes.iter() {
+            if let Some(pcb) = s.as_ref() {
+                let state_u8 = match pcb.state {
+                    ProcessState::Ready | ProcessState::Running => 0u8,
+                    ProcessState::Blocked    => 1u8,
+                    ProcessState::Terminated => 2u8,
+                };
+                out.push((pcb.pid, state_u8, pcb.priority));
+            }
+        }
+        out
+    }
+
     pub fn get_ready_processes(&self) -> ProcList<ProcessId> {
         let mut out = ProcList::new();
         for s in self.processes.iter() {
@@ -339,6 +358,84 @@ impl ProcessTable {
         for slot in self.processes.iter_mut() {
             if let Some(pcb) = slot.as_mut() {
                 pcb.ipc_rate_used = 0;
+            }
+        }
+    }
+
+    /// Reset per-major-frame CPU budget counters.
+    ///
+    /// Called every `CPU_BUDGET_FRAME_TICKS` ticks by the scheduler so that
+    /// processes with a `cpu_budget_ticks` quota can consume their allocation
+    /// again in the next scheduling frame.
+    ///
+    /// IEC 61508 §7.4.1 (temporal partitioning): no process may accumulate
+    /// CPU time across frames; budgets are window-relative.
+    pub fn reset_cpu_budget_counters(&mut self) {
+        for slot in self.processes.iter_mut() {
+            if let Some(pcb) = slot.as_mut() {
+                pcb.cpu_budget_used = 0;
+            }
+        }
+    }
+
+    /// Return an immutable reference to `pid`'s PCB.
+    ///
+    /// Used by routines that need to inspect multiple PCBs simultaneously
+    /// without a mutable borrow (e.g., cycle detection).
+    pub fn get_process_ref(&self, pid: ProcessId) -> Option<&ProcessControlBlock> {
+        self.processes.iter()
+            .filter_map(|s| s.as_ref())
+            .find(|pcb| pcb.pid == pid)
+    }
+
+    /// Detect a cycle in the `waiting_for` wait-for graph.
+    ///
+    /// Returns `true` iff adding the directed edge `waiter → target` (i.e.,
+    /// `waiter` is about to block waiting for `target`) would create a cycle,
+    /// meaning `target` already transitively waits for `waiter`.
+    ///
+    /// # Algorithm
+    /// Iterative traversal from `target`, following `waiting_for` links.  A
+    /// `visited` bitmap (one bit per process slot) prevents looping on
+    /// already-existing cycles.  With `MAX_PROCESSES == 32` this is O(32) —
+    /// fully deterministic, zero heap allocation, bounded execution time.
+    ///
+    /// # IEC 61508 §7.4.4
+    /// Blocking a process when the resulting wait graph contains a cycle creates
+    /// a deadlock: the involved processes will never run again.  Detecting and
+    /// rejecting such blocks prevents permanent scheduling starvation without
+    /// requiring any external timeout.
+    pub fn detect_cycle(&self, waiter: ProcessId, target: ProcessId) -> bool {
+        let mut visited = [false; MAX_PROCESSES];
+        let mut current = target;
+
+        loop {
+            // Locate current's slot index in the flat array.
+            let slot_idx = match self.processes.iter().position(|s| {
+                s.as_ref().map_or(false, |p| p.pid == current)
+            }) {
+                Some(i) => i,
+                None    => return false, // process not found — no path
+            };
+
+            if visited[slot_idx] {
+                // We've been here before: the existing graph has a cycle that
+                // does not involve `waiter` — safe to block.
+                return false;
+            }
+            visited[slot_idx] = true;
+
+            match &self.processes[slot_idx] {
+                None => return false,
+                Some(pcb) => match pcb.waiting_for {
+                    None       => return false, // no outgoing edge — no path to waiter
+                    Some(next) => {
+                        if next == waiter {
+                            return true; // cycle: adding waiter→target closes the loop
+                        }
+                        current = next;
+                    }
+                },
             }
         }
     }
@@ -591,5 +688,82 @@ mod tests {
         let cap2 = Capability::new(CapKind::Service, CAP_R, 2);
         let slot2 = table.cap_alloc(pid, cap2).unwrap();
         assert_eq!(slot, slot2, "revoked slot must be reused");
+    }
+
+    // ── detect_cycle tests ────────────────────────────────────────────────────
+
+    /// No waiting_for links → no cycle.
+    #[test]
+    fn test_detect_cycle_no_links() {
+        let mut table = ProcessTable::new();
+        let a = table.create_process(0x1000, 0, 0).unwrap();
+        let b = table.create_process(0x2000, 0, 0).unwrap();
+        assert!(!table.detect_cycle(a, b), "no links → no cycle");
+    }
+
+    /// b → c but c has no outgoing edge → adding a → b is safe.
+    #[test]
+    fn test_detect_cycle_chain_no_cycle() {
+        let mut table = ProcessTable::new();
+        let a = table.create_process(0x1000, 0, 0).unwrap();
+        let b = table.create_process(0x2000, 0, 0).unwrap();
+        let c = table.create_process(0x3000, 0, 0).unwrap();
+        // b waits for c; c has no outgoing edge.
+        if let Some(pcb) = table.get_process(b) {
+            pcb.waiting_for = Some(c);
+        }
+        assert!(!table.detect_cycle(a, b),
+            "chain b→c with no link back to a must not be a cycle");
+    }
+
+    /// Direct cycle: b waits for a; adding a → b creates a cycle.
+    #[test]
+    fn test_detect_cycle_direct() {
+        let mut table = ProcessTable::new();
+        let a = table.create_process(0x1000, 0, 0).unwrap();
+        let b = table.create_process(0x2000, 0, 0).unwrap();
+        if let Some(pcb) = table.get_process(b) {
+            pcb.waiting_for = Some(a);
+        }
+        assert!(table.detect_cycle(a, b),
+            "direct cycle a→b→a must be detected");
+    }
+
+    /// Indirect cycle: b → c → a; adding a → b creates a three-party cycle.
+    #[test]
+    fn test_detect_cycle_indirect() {
+        let mut table = ProcessTable::new();
+        let a = table.create_process(0x1000, 0, 0).unwrap();
+        let b = table.create_process(0x2000, 0, 0).unwrap();
+        let c = table.create_process(0x3000, 0, 0).unwrap();
+        if let Some(pcb) = table.get_process(b) { pcb.waiting_for = Some(c); }
+        if let Some(pcb) = table.get_process(c) { pcb.waiting_for = Some(a); }
+        assert!(table.detect_cycle(a, b),
+            "three-party cycle a→b→c→a must be detected");
+    }
+
+    /// detect_cycle with an unknown target PID returns false (safe to proceed).
+    #[test]
+    fn test_detect_cycle_unknown_pid() {
+        let table = ProcessTable::new();
+        let ghost = ProcessId::new(999);
+        let a     = ProcessId::new(1);
+        assert!(!table.detect_cycle(a, ghost),
+            "unknown target pid must be treated as no-path (not a cycle)");
+    }
+
+    // ── reset_cpu_budget_counters test ────────────────────────────────────────
+
+    /// reset_cpu_budget_counters zeroes cpu_budget_used for all processes.
+    #[test]
+    fn test_reset_cpu_budget_counters() {
+        let mut table = ProcessTable::new();
+        let p1 = table.create_process(0x1000, 0, 0).unwrap();
+        let p2 = table.create_process(0x2000, 0, 0).unwrap();
+        if let Some(pcb) = table.get_process(p1) { pcb.cpu_budget_used = 42; }
+        if let Some(pcb) = table.get_process(p2) { pcb.cpu_budget_used = 99; }
+        table.reset_cpu_budget_counters();
+        assert_eq!(table.get_process(p1).unwrap().cpu_budget_used, 0);
+        assert_eq!(table.get_process(p2).unwrap().cpu_budget_used, 0);
     }
 }

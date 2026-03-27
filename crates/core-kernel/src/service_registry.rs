@@ -44,15 +44,16 @@ pub fn register(name: &[u8], pid: u32) -> bool {
     // uninitialised table slot and would allow spurious lookup matches.
     if key.is_empty() { return false; }
     unsafe {
+        let table = core::ptr::addr_of_mut!(TABLE) as *mut [ServiceEntry; MAX_SERVICES];
         // Update existing entry if name is already registered.
-        for entry in TABLE.iter_mut() {
+        for entry in (*table).iter_mut() {
             if entry.used && trim_name(&entry.name) == key {
                 entry.pid = pid;
                 return true;
             }
         }
         // Find a free slot.
-        for entry in TABLE.iter_mut() {
+        for entry in (*table).iter_mut() {
             if !entry.used {
                 entry.name = [0u8; NAME_LEN];
                 let copy_len = key.len().min(NAME_LEN - 1);
@@ -72,7 +73,8 @@ pub fn register(name: &[u8], pid: u32) -> bool {
 pub fn lookup(name: &[u8]) -> Option<u32> {
     let key = trim_name(name);
     unsafe {
-        for entry in TABLE.iter() {
+        let table = core::ptr::addr_of!(TABLE) as *const [ServiceEntry; MAX_SERVICES];
+        for entry in (*table).iter() {
             if entry.used && trim_name(&entry.name) == key {
                 return Some(entry.pid);
             }
@@ -81,10 +83,27 @@ pub fn lookup(name: &[u8]) -> Option<u32> {
     None
 }
 
+/// Look up the registered name for `pid`.
+///
+/// Returns the 16-byte name slot (null-padded) if found, or all-zeros if
+/// the process has not called `SYS_REGISTER`.
+pub fn lookup_by_pid(pid: u32) -> [u8; NAME_LEN] {
+    unsafe {
+        let table = core::ptr::addr_of!(TABLE) as *const [ServiceEntry; MAX_SERVICES];
+        for entry in (*table).iter() {
+            if entry.used && entry.pid == pid {
+                return entry.name;
+            }
+        }
+    }
+    [0u8; NAME_LEN]
+}
+
 /// Unregister the entry for `pid`.  Returns `true` if an entry was removed.
 pub fn unregister_pid(pid: u32) -> bool {
     unsafe {
-        for entry in TABLE.iter_mut() {
+        let table = core::ptr::addr_of_mut!(TABLE) as *mut [ServiceEntry; MAX_SERVICES];
+        for entry in (*table).iter_mut() {
             if entry.used && entry.pid == pid {
                 entry.used = false;
                 return true;

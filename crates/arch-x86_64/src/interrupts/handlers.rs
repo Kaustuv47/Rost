@@ -107,7 +107,6 @@ extern "C" fn handle_divide_by_zero(frame: &ExceptionFrame) {
     dump_registers(frame);
     if from_user(frame) {
         terminate_faulting_process(0xDE);
-        return; // context switch happened; never iretq back to dead process
     }
     hal::uart::print_str("System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
@@ -116,11 +115,22 @@ extern "C" fn handle_divide_by_zero(frame: &ExceptionFrame) {
 #[cold]
 extern "C" fn handle_general_protection(frame: &ExceptionFrame) {
     hal::uart::print_str("\n[EXCEPTION #GP — General Protection Fault]\n");
+    hal::uart::print_str("  frame@");
+    hal::uart::print_hex(frame as *const ExceptionFrame as u64);
+    hal::uart::print_str("\n");
+    hal::uart::print_str("  err=");
+    hal::uart::print_hex(frame.error_code);
+    hal::uart::print_str("\n");
+    hal::uart::print_str("  rip=");
+    hal::uart::print_hex(frame.rip);
+    hal::uart::print_str("\n");
+    hal::uart::print_str("  cs=");
+    hal::uart::print_hex(frame.cs);
+    hal::uart::print_str("\n");
     hal::uart::print_str(if from_user(frame) { "  origin: user-mode\n" } else { "  origin: kernel\n" });
     dump_registers(frame);
     if from_user(frame) {
         terminate_faulting_process(0x0D);
-        return;
     }
     record_crash(frame, 0x0D, 0);
     hal::uart::print_str("System halted.\n");
@@ -131,13 +141,20 @@ extern "C" fn handle_general_protection(frame: &ExceptionFrame) {
 extern "C" fn handle_page_fault(frame: &ExceptionFrame) {
     let cr2 = crate::cpu::read_cr2();
     hal::uart::print_str("\n[EXCEPTION #PF — Page Fault]\n");
-    hal::uart::print_str(if from_user(frame) { "  origin: user-mode\n" } else { "  origin: kernel\n" });
+    hal::uart::print_str("  frame@");
+    hal::uart::print_hex(frame as *const ExceptionFrame as u64);
+    hal::uart::print_str("\n");
     hal::uart::print_str("  fault addr="); hal::uart::print_hex(cr2);
     hal::uart::print_str("\n");
+    hal::uart::print_str("  err=");  hal::uart::print_hex(frame.error_code);
+    hal::uart::print_str("  rip=");  hal::uart::print_hex(frame.rip);
+    hal::uart::print_str("  cs=");   hal::uart::print_hex(frame.cs);
+    hal::uart::print_str("  rfl=");  hal::uart::print_hex(frame.rflags);
+    hal::uart::print_str("\n");
+    hal::uart::print_str(if from_user(frame) { "  origin: user-mode\n" } else { "  origin: kernel\n" });
     dump_registers(frame);
     if from_user(frame) {
         terminate_faulting_process(0x0E);
-        return;
     }
     record_crash(frame, 0x0E, cr2);
     hal::uart::print_str("System halted.\n");
@@ -176,12 +193,31 @@ extern "C" fn handle_machine_check(frame: &ExceptionFrame) {
 
 // ── Ring-3 process fault handling ─────────────────────────────────────────────
 
-/// Terminate the current ring-3 process and notify init (PID 1) of the fault.
+/// Scratch area used by `terminate_faulting_process` as the "old" context save
+/// target when switching away from a dead ring-3 process.
 ///
-/// After terminating, force a context switch so the scheduler picks the next
-/// ready process.  The exception handler returns normally; `iretq` is never
-/// reached for the terminated process.
-fn terminate_faulting_process(fault_code: u64) {
+/// `switch_context_noints` requires an `old` context pointer to save the
+/// current callee-saved registers into.  For a terminated process we do not
+/// care about those registers, so we divert them here and never read them back.
+///
+/// Safe: single-CPU system; exception handlers are non-reentrant on this path.
+static mut EXCEPTION_DEAD_CTX: core_kernel::process::pcb::TaskContext =
+    core_kernel::process::pcb::TaskContext::zero();
+
+/// Terminate the current ring-3 process and switch to the next ready process.
+///
+/// Must NOT call `tick_scheduler_isr()` after `terminate_process()`:
+/// `terminate_process` sets `current_process = None`, which causes
+/// `timer_tick()` to keep `preempt = false` and return `None` — so no context
+/// switch would occur and the exception handler's `iretq` would return to the
+/// now-dead process, causing an infinite fault loop and eventually a triple
+/// fault / watchdog reset.
+///
+/// Instead, `force_schedule_next()` picks the next ready process unconditionally
+/// and we call `switch_context_noints` directly, saving the dead process's
+/// stale registers into `EXCEPTION_DEAD_CTX` (which is never loaded again).
+#[cold]
+fn terminate_faulting_process(fault_code: u64) -> ! {
     use core_kernel::scheduler::{get_global, CURRENT_PID};
 
     let pid_raw = CURRENT_PID.load(Ordering::Relaxed);
@@ -199,11 +235,37 @@ fn terminate_faulting_process(fault_code: u64) {
         msg.set_data(1, pid_raw as u64);
         sched.send_message(pid, init, msg);
 
+        // Remove the dead process.  After this, current_process == None.
         sched.terminate_process(pid);
+
+        // Pick the next ready process directly — bypasses the preempt flag that
+        // timer_tick() would never set when current_process is None.
+        if let Some((new_ctx, new_pml4, kernel_rsp)) = sched.force_schedule_next() {
+            if let Some(next_pid) = sched.current_process() {
+                CURRENT_PID.store(next_pid.as_u32(), Ordering::Relaxed);
+            }
+            // Re-arm the one-shot LAPIC timer so preemption keeps firing after
+            // we switch away (this path never returns to tick_scheduler_isr).
+            crate::apic::lapic::arm_oneshot(1);
+            unsafe {
+                crate::cpu::tss::set_rsp0(kernel_rsp);
+                crate::context::switch_context_noints(
+                    core::ptr::addr_of_mut!(EXCEPTION_DEAD_CTX),
+                    new_ctx,
+                    new_pml4,
+                );
+                // switch_context_noints does not return: `ret` inside it jumps
+                // to the new process's kernel context.
+                core::hint::unreachable_unchecked();
+            }
+        }
     }
 
-    // Force the scheduler to switch away from this now-dead process.
-    crate::cpu::tick_scheduler_isr();
+    // No ready process (all terminated or blocked) — halt until a timer tick
+    // unblocks something.  Interrupts are already off (exception gate); re-enable
+    // them so the timer ISR can fire.
+    unsafe { core::arch::asm!("sti", options(nostack, preserves_flags)); }
+    loop { unsafe { core::arch::asm!("hlt", options(nostack, nomem)); } }
 }
 
 /// Catch-all for any unexpected interrupt/exception vector.
@@ -244,7 +306,7 @@ macro_rules! exception_stub_no_code {
                 "push rdx", "push rsi", "push rdi",
                 "push r8",  "push r9",  "push r10", "push r11",
                 "push r12", "push r13", "push r14", "push r15",
-                "mov  rdi, rsp",    // &ExceptionFrame
+                "mov  rcx, rsp",    // &ExceptionFrame — Windows ABI: arg1 in rcx
                 "sub  rsp, 8",
                 "call {inner}",
                 "add  rsp, 8",
@@ -270,7 +332,7 @@ macro_rules! exception_stub_with_code {
                 "push rdx", "push rsi", "push rdi",
                 "push r8",  "push r9",  "push r10", "push r11",
                 "push r12", "push r13", "push r14", "push r15",
-                "mov  rdi, rsp",
+                "mov  rcx, rsp",    // &ExceptionFrame — Windows ABI: arg1 in rcx
                 "sub  rsp, 8",
                 "call {inner}",
                 "add  rsp, 8",
@@ -331,21 +393,20 @@ pub unsafe extern "C" fn spurious_handler() {
 #[unsafe(naked)]
 pub unsafe extern "C" fn unexpected_interrupt_common() {
     core::arch::naked_asm!(
-        // On entry: stack = ... | vector | rflags | cs | rip
+        // On entry: stack = ... | rflags | cs | rip
         // (CPU did NOT push an error code for most vectors)
-        // rdi = vector (we pushed it in the per-vector stub)
-        // Build a minimal ExceptionFrame-compatible view for the printer.
+        // rcx = vector number (set by the per-vector stub before jmp here)
+        // Windows x64 ABI: arg1=rcx (vector), arg2=rdx (frame ptr)
         "push 0",           // dummy error_code
         "push rax", "push rbp", "push rbx", "push rcx",
         "push rdx", "push rsi", "push rdi",
         "push r8",  "push r9",  "push r10", "push r11",
         "push r12", "push r13", "push r14", "push r15",
-        // vector is now at [rsp + 15*8 + 8 + 8*8] — too deep; pass via rsi instead.
-        // The per-vector stubs put the vector in rax before jumping here.
-        "mov  rsi, rsp",    // rsi = &ExceptionFrame
+        // rcx still holds the vector number (push saved it to the frame but
+        // did not clear the register).
+        "mov  rdx, rsp",    // rdx = &ExceptionFrame — Windows ABI: arg2 in rdx
         "sub  rsp, 8",
-        // rdi still holds the vector (set by caller stub).
-        "call {inner}",
+        "call {inner}",     // handle_unexpected(vector=rcx, frame=rdx)
         "add  rsp, 8",
         "pop  r15", "pop  r14", "pop  r13", "pop  r12",
         "pop  r11", "pop  r10", "pop  r9",  "pop  r8",
@@ -358,13 +419,14 @@ pub unsafe extern "C" fn unexpected_interrupt_common() {
 }
 
 /// Generate one catch-all stub per vector (used for all unregistered slots).
-/// The stub puts the vector number in rdi then jumps to the common handler.
+/// The stub puts the vector number in rcx (Windows ABI arg1) then jumps to
+/// the common handler.
 macro_rules! unexpected_stub {
     ($name:ident, $vec:expr) => {
         #[unsafe(naked)]
         pub unsafe extern "C" fn $name() {
             core::arch::naked_asm!(
-                concat!("mov rdi, ", $vec),
+                concat!("mov rcx, ", $vec),
                 "jmp {common}",
                 common = sym unexpected_interrupt_common,
             );

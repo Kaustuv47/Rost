@@ -26,7 +26,7 @@ pub mod madt;
 
 pub use dmar::{DmarInfo, DrhUnit, parse_dmar};
 pub use fadt::{FadtInfo, parse_fadt};
-pub use hpet::{HpetInfo, find_hpet, parse_hpet};
+pub use hpet::{HpetInfo, find_hpet, hpet_mmio_base, parse_hpet};
 pub use madt::{MadtInfo, LocalApic, IoApic, IrqOverride, parse_madt};
 
 // ── SDT constants ─────────────────────────────────────────────────────────────
@@ -90,18 +90,21 @@ unsafe fn read_u64(ptr: *const u8) -> u64 {
 // Offsets are per ACPI 6.5 §5.2.5 (SDT header) and §5.2.14 (RSDP).
 
 // SDT common header field offsets
+#[allow(dead_code)]
 const SDT_OFF_SIGNATURE: usize = 0;  // [u8; 4]
 const SDT_OFF_LENGTH:    usize = 4;  // u32
 // (revision at 8, checksum at 9 — only used as a block for the checksum)
 
 // RSDP field offsets (ACPI 1.0, 20-byte structure)
 const RSDP_OFF_SIGNATURE:  usize = 0;  // [u8; 8] = "RSD PTR "
+#[allow(dead_code)]
 const RSDP_OFF_CHECKSUM:   usize = 8;  // u8  — checksum of first 20 bytes
 const RSDP_OFF_REVISION:   usize = 15; // u8  — 0=v1, 2=v2
 const RSDP_OFF_RSDT_ADDR:  usize = 16; // u32 — physical address of RSDT
 const RSDP_V1_LEN:         usize = 20;
 
 // RSDP extension (ACPI ≥ 2.0, appended at offset 20)
+#[allow(dead_code)]
 const RSDP_OFF_LENGTH:     usize = 20; // u32 — total length of RSDP v2 struct
 const RSDP_OFF_XSDT_ADDR:  usize = 24; // u64 — physical address of XSDT
 const RSDP_V2_LEN:         usize = 36;

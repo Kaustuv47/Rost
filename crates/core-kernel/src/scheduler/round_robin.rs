@@ -736,6 +736,14 @@ impl Scheduler {
     }
 
     /// Return total CPU ticks consumed by `pid`.
+    /// Snapshot all active processes as `(pid, state_u8, priority)` triples.
+    ///
+    /// Delegates to `ProcessTable::list_all()`; see that function for the
+    /// `state_u8` encoding.  Used by `SYS_LIST_PROCS`.
+    pub fn list_processes(&self) -> ProcList<(ProcessId, u8, u8)> {
+        self.process_table.borrow().list_all()
+    }
+
     pub fn cpu_time_for(&self, pid: ProcessId) -> Option<u64> {
         self.process_table.borrow_mut()
             .get_process(pid)

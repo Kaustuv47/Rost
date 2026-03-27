@@ -26,6 +26,7 @@ use crate::acpi::hpet::HpetInfo;
 
 // ── HPET MMIO register offsets ────────────────────────────────────────────────
 
+#[allow(dead_code)]
 const REG_GCI: u64 = 0x000; // General Capabilities & ID (64-bit)
 const REG_GCR: u64 = 0x010; // General Configuration     (64-bit)
 const REG_MCR: u64 = 0x0F0; // Main Counter Value        (64-bit)

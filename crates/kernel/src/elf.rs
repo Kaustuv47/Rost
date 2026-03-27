@@ -25,6 +25,7 @@ use core_kernel::memory::{
 
 // ── ELF constants ─────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 const ELFMAG:     [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8      = 2;
 const ELFDATA2LSB: u8     = 1;  // little-endian
@@ -35,6 +36,7 @@ const PT_LOAD:    u32     = 1;   // loadable segment
 // Segment flags (p_flags)
 const PF_EXEC:  u32 = 0x1;
 const PF_WRITE: u32 = 0x2;
+#[allow(dead_code)]
 const PF_READ:  u32 = 0x4;
 
 // ── ELF structures ────────────────────────────────────────────────────────────
@@ -173,33 +175,46 @@ pub fn load(data: &[u8], pml4: Option<&mut PageTable>) -> Option<LoadedElf> {
         if phdr.p_flags & PF_WRITE != 0 { flags |= PTE_WRITABLE; }
         if phdr.p_flags & PF_EXEC  == 0 { flags |= PTE_NO_EXECUTE; }
 
-        // Map and fill pages in 4 KB chunks.
-        let mut page_off: usize = 0;
-        while page_off < mem_size {
+        // Handle non-page-aligned p_vaddr (common in PIE/ET_DYN binaries).
+        // The segment may start at e.g. vaddr=0x1890, which belongs to the
+        // physical page mapped at virtual 0x1000.  We must copy seg_data[0]
+        // to phys_page[0x890], not phys_page[0].
+        let page_align_offset = (virt_base & 0xFFF) as usize;
+        let virt_page_base    = virt_base & !0xFFF; // page-aligned start
+        let total_pages       = (page_align_offset + mem_size + 4095) / 4096;
+
+        for page_idx in 0..total_pages {
             let phys_page = global_alloc_4k()?;
             frame_tag(phys_page, FrameKind::UserOwned);
             unsafe { core::ptr::write_bytes(phys_page as *mut u8, 0, 4096); }
 
-            // Copy file data into this page (up to 4 KB or remaining bytes).
-            let copy_start = page_off;
-            let copy_end   = core::cmp::min(page_off + 4096, seg_data.len());
-            if copy_start < seg_data.len() {
-                let n = copy_end - copy_start;
+            // Offset within seg_data that corresponds to the start of this page.
+            // First page: data starts at seg_data[0], placed at phys_page[page_align_offset].
+            // Later pages: data starts at seg_data[page_idx*4096 - page_align_offset], at phys_page[0].
+            let (seg_start, phys_offset) = if page_idx == 0 {
+                (0usize, page_align_offset)
+            } else {
+                (page_idx * 4096 - page_align_offset, 0usize)
+            };
+
+            if seg_start < seg_data.len() {
+                let n = core::cmp::min(
+                    seg_data.len() - seg_start,
+                    4096 - phys_offset,
+                );
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        seg_data[copy_start..].as_ptr(),
-                        phys_page as *mut u8,
+                        seg_data[seg_start..].as_ptr(),
+                        (phys_page as *mut u8).add(phys_offset),
                         n,
                     );
                 }
             }
 
-            let virt_page = virt_base + page_off as u64;
+            let virt_page = virt_page_base + (page_idx * 4096) as u64;
             if !map_page_global(pml4_ref, virt_page, phys_page, flags) {
                 return None;
             }
-
-            page_off += 4096;
         }
     }
 
@@ -209,7 +224,7 @@ pub fn load(data: &[u8], pml4: Option<&mut PageTable>) -> Option<LoadedElf> {
 // ── Convenience: spawn an ELF as a new ring-3 process ────────────────────────
 
 /// Number of 4 KB pages to allocate for a process's user-mode stack.
-const USER_STACK_PAGES: usize = 4; // 16 KB
+const USER_STACK_PAGES: usize = 32; // 128 KB — Shell struct ~20 KB + deep call frames
 
 /// Copy kernel page-table entries into a user-process PML4.
 ///

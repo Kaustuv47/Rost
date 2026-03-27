@@ -20,10 +20,26 @@ pub const KERNEL_GUARD_SIZE: usize = 4096;
 pub const KERNEL_SLOT_SIZE:  usize = KERNEL_GUARD_SIZE + KERNEL_STACK_SIZE; // 12 KB
 pub const MAX_KERNEL_STACKS: usize = 32;
 
+/// 4 KB-aligned wrapper for a single kernel-stack slot.
+///
+/// The `align(4096)` attribute guarantees that every slot starts at a 4 KB
+/// page boundary in BSS.  Without this alignment the guard-page unmap in
+/// `install_kernel_stack_guard_pages` would remove the *entire* 4 KB page
+/// containing the slot's first byte, which may overlap with other BSS
+/// variables placed on the same page by the linker — causing spurious #PF
+/// faults when those variables are next accessed.
+#[repr(C, align(4096))]
+struct KernelStackSlot([u8; KERNEL_SLOT_SIZE]);
+
+impl KernelStackSlot {
+    const ZERO: Self = KernelStackSlot([0u8; KERNEL_SLOT_SIZE]);
+}
+
 // Zero-initialised in BSS; never on the Rust stack.
-// Each slot is KERNEL_SLOT_SIZE bytes: 4 KB guard + 8 KB stack.
-static mut KERNEL_STACKS: [[u8; KERNEL_SLOT_SIZE]; MAX_KERNEL_STACKS] =
-    [[0u8; KERNEL_SLOT_SIZE]; MAX_KERNEL_STACKS];
+// align(4096) on KernelStackSlot ensures every slot (and thus its guard page)
+// starts at a 4 KB page boundary, so unmap_page only removes the guard bytes.
+static mut KERNEL_STACKS: [KernelStackSlot; MAX_KERNEL_STACKS] =
+    [KernelStackSlot::ZERO; MAX_KERNEL_STACKS];
 
 /// Monotone counter used for forward allocation before any slot has been freed.
 /// Once freed slots are available in `STACK_RECLAIM`, those are preferred.
@@ -62,14 +78,28 @@ pub fn alloc_kernel_stack() -> Option<(usize, u64, u64)> {
     let id = unsafe {
         if STACK_RECLAIM_TOP > 0 {
             STACK_RECLAIM_TOP -= 1;
-            STACK_RECLAIM[STACK_RECLAIM_TOP] as usize
+            let id = STACK_RECLAIM[STACK_RECLAIM_TOP] as usize;
+            // Zero the reclaimed stack before handing it to a new process so
+            // the new process cannot observe stale data from the previous owner.
+            //
+            // We zero HERE (on allocation) rather than in free_kernel_stack
+            // (on deallocation) because free_kernel_stack is called from
+            // ProcessControlBlock::drop(), which is triggered by terminate_process()
+            // while the CPU may still be executing on that very kernel stack
+            // (exception handler → terminate_faulting_process path).  Zeroing
+            // the live stack corrupts all return addresses, causing an immediate
+            // triple fault.  BSS stacks from NEXT_STACK are already zero.
+            let stack_start = KERNEL_STACKS[id].0.as_mut_ptr().add(KERNEL_GUARD_SIZE);
+            core::ptr::write_bytes(stack_start, 0, KERNEL_STACK_SIZE);
+            id
         } else {
             let id = NEXT_STACK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if id >= MAX_KERNEL_STACKS { return None; }
             id
+            // Fresh BSS stacks are already zero-initialised — no write_bytes needed.
         }
     };
-    let base  = unsafe { KERNEL_STACKS[id].as_ptr() as u64 };
+    let base  = unsafe { KERNEL_STACKS[id].0.as_ptr() as u64 };
     let guard = base;                           // first 4 KB: guard page
     let top   = base + KERNEL_SLOT_SIZE as u64; // stack grows down from here
     Some((id, guard, top))
@@ -90,10 +120,19 @@ pub fn alloc_kernel_stack() -> Option<(usize, u64, u64)> {
 pub fn free_kernel_stack(stack_id: usize) {
     if stack_id >= MAX_KERNEL_STACKS { return; }
     unsafe {
-        // Zero the usable portion of the stack (skip guard page at offset 0).
-        let stack_start = KERNEL_STACKS[stack_id].as_mut_ptr().add(KERNEL_GUARD_SIZE);
-        core::ptr::write_bytes(stack_start, 0, KERNEL_STACK_SIZE);
-        // Push the slot id onto the reclaim stack.
+        // Return the slot to the reclaim pool.
+        //
+        // NOTE: we do NOT zero the stack here.  free_kernel_stack is called from
+        // ProcessControlBlock::drop(), which is triggered by terminate_process()
+        // — potentially while the CPU is still executing on this very kernel stack
+        // (exception handler → terminate_faulting_process path).  Zeroing the
+        // live stack would corrupt all return addresses and cause an immediate
+        // triple fault.
+        //
+        // Instead, the stack is zeroed in alloc_kernel_stack() when the slot is
+        // popped from the reclaim pool, ensuring a new process cannot observe the
+        // previous owner's kernel-stack data (IEC 61508 §7.4.3 isolation).
+        // Fresh slots from NEXT_STACK are already zero-initialised (BSS).
         if STACK_RECLAIM_TOP < MAX_KERNEL_STACKS {
             STACK_RECLAIM[STACK_RECLAIM_TOP] = stack_id as u8;
             STACK_RECLAIM_TOP += 1;
@@ -107,7 +146,7 @@ pub fn free_kernel_stack(stack_id: usize) {
 /// enumerate all slots and unmap their guard pages after page tables are live.
 pub fn kernel_stack_guard_addr(stack_id: usize) -> Option<u64> {
     if stack_id >= MAX_KERNEL_STACKS { return None; }
-    Some(unsafe { KERNEL_STACKS[stack_id].as_ptr() as u64 })
+    Some(unsafe { KERNEL_STACKS[stack_id].0.as_ptr() as u64 })
 }
 
 // ── Capability table ──────────────────────────────────────────────────────────
@@ -247,6 +286,15 @@ pub struct ProcessControlBlock {
     // ── Resource quotas ───────────────────────────────────────────────────────
     /// Maximum physical pages this process may map.  0 = unlimited (kernel).
     pub memory_quota_pages: u32,
+    /// Physical pages mapped so far.
+    ///
+    /// Incremented in `SYS_MAP` / `SYS_MAP_SHARE` on each successful page mapping.
+    /// Compared against `memory_quota_pages` before every allocation; the mapping
+    /// is rejected when `memory_pages_used >= memory_quota_pages` (and quota ≠ 0).
+    ///
+    /// Never decremented (no `SYS_UNMAP` yet); the count vanishes with the PCB
+    /// when the process terminates.  IEC 61508 §7.4.5.
+    pub memory_pages_used:  u32,
     /// Per-major-frame CPU budget in ticks (temporal partitioning).  0 = unlimited.
     pub cpu_budget_ticks:   u32,
     /// Budget consumed so far in the current frame.
@@ -346,6 +394,7 @@ impl ProcessControlBlock {
             time_slice:         10,
             cpu_time:           0,
             memory_quota_pages: 0,
+            memory_pages_used:  0,
             cpu_budget_ticks:   0,
             cpu_budget_used:    0,
             ipc_rate_limit:     0,
@@ -393,6 +442,7 @@ impl ProcessControlBlock {
             time_slice:         10,
             cpu_time:           0,
             memory_quota_pages: 0,
+            memory_pages_used:  0,
             cpu_budget_ticks:   0,
             cpu_budget_used:    0,
             ipc_rate_limit:     0,
@@ -454,7 +504,7 @@ mod tests {
 
         // Write a distinctive pattern into the usable stack region.
         unsafe {
-            let usable = KERNEL_STACKS[id].as_mut_ptr().add(KERNEL_GUARD_SIZE);
+            let usable = KERNEL_STACKS[id].0.as_mut_ptr().add(KERNEL_GUARD_SIZE);
             core::ptr::write_bytes(usable, 0xCC, KERNEL_STACK_SIZE);
         }
 
@@ -462,7 +512,7 @@ mod tests {
         free_kernel_stack(id);
 
         unsafe {
-            let usable = KERNEL_STACKS[id].as_ptr().add(KERNEL_GUARD_SIZE);
+            let usable = KERNEL_STACKS[id].0.as_ptr().add(KERNEL_GUARD_SIZE);
             let slice = core::slice::from_raw_parts(usable, KERNEL_STACK_SIZE);
             assert!(
                 slice.iter().all(|&b| b == 0),

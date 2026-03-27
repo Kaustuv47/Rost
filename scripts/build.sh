@@ -25,18 +25,33 @@ fi
 export SOURCE_DATE_EPOCH
 
 # Remap absolute source paths in debug info to reproducible relative paths.
-export RUSTFLAGS="--remap-path-prefix=${ROOT}=/rost"
+# NOTE: RUSTFLAGS env var overrides .cargo/config.toml rustflags entirely, so
+# each cargo invocation must include ALL required flags for that workspace.
+REMAP="--remap-path-prefix=${ROOT}=/rost"
 
-# Step 1: Build ring-3 server ELF binaries (x86_64-unknown-none).
+# Ring-3 server flags: no stdlib, no red-zone, static (non-PIE) relocation so
+# that the ELF loader does not need to apply RELA relocations at load time.
+SERVERS_FLAGS="${REMAP} -C link-arg=-nostdlib -C no-redzone -C relocation-model=static"
+
+# Step 1a: Build hello-world first so the VFS can embed it via include_bytes!().
+# hello-world is a dependency of the VFS static filesystem (F_HELLO node), but
+# Cargo does not know about this file-level dependency.  We resolve it by
+# compiling hello-world explicitly before the rest of the workspace.
+echo "[build] Compiling hello-world demo binary..."
+RUSTFLAGS="${SERVERS_FLAGS}" cargo build --manifest-path "$ROOT/servers/Cargo.toml" --target x86_64-unknown-none -p hello-world
+
+# Step 1b: Build all remaining ring-3 server ELF binaries (x86_64-unknown-none).
 # The kernel embeds these at compile time via include_bytes!(), so they
 # must exist before the kernel is compiled.
 echo "[build] Compiling ring-3 servers (SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH})..."
-cargo build --manifest-path "$ROOT/servers/Cargo.toml" --target x86_64-unknown-none
+RUSTFLAGS="${SERVERS_FLAGS}" cargo build --manifest-path "$ROOT/servers/Cargo.toml" --target x86_64-unknown-none
 
 # Step 2: Build the kernel (x86_64-unknown-uefi).
 # Passes extra args (e.g. --release or --features safety-mode) verbatim.
+# The kernel's .cargo/config.toml adds -Z stack-protector=strong; repeat it
+# here since RUSTFLAGS overrides the config-file flags.
 echo "[build] Compiling kernel..."
-cargo build --manifest-path "$ROOT/Cargo.toml" --target x86_64-unknown-uefi "$@"
+RUSTFLAGS="${REMAP} -Z stack-protector=strong" cargo build --manifest-path "$ROOT/Cargo.toml" --target x86_64-unknown-uefi "$@"
 
 mkdir -p "$ROOT/build/efi/boot"
 cp "$ROOT/target/x86_64-unknown-uefi/debug/Rost.efi" "$ROOT/build/efi/boot/bootx64.efi"

@@ -122,11 +122,20 @@ pub fn map_page_global(
     // allocator so mapping never silently fails during pool exhaustion.
     let alloc_pt_frame = || pool_alloc_pt().or_else(global_alloc_4k);
 
+    // x86-64 rule: ALL levels of the page walk (PML4 → PDPT → PD → PT) must
+    // have U/S=1 for a user-mode access to succeed.  Propagate PTE_USER from
+    // the leaf flags into every intermediate table entry we create or touch.
+    let user_flag = flags & PTE_USER;
+
     let alloc_fn = |entry: &mut u64| -> Option<u64> {
         if *entry & PTE_PRESENT == 0 {
             let p = alloc_pt_frame()?;
             unsafe { core::ptr::write_bytes(p as *mut u8, 0, 4096); }
-            *entry = (p & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE;
+            *entry = (p & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | user_flag;
+        } else if user_flag != 0 && (*entry & PTE_USER == 0) {
+            // Upgrade an existing supervisor-only entry to also allow user
+            // access (can happen when a kernel PT is later reused for user).
+            *entry |= PTE_USER;
         }
         Some(*entry & PTE_ADDR_MASK)
     };

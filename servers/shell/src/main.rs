@@ -39,7 +39,7 @@ use shell::Shell;
 pub extern "C" fn _start() -> ! {
     // Register under "rost-shell" so uart-drv can discover us and push
     // keystroke IPC messages to our queue.
-    syscall::register(b"rost-shell\0");
+    syscall::register(b"rost-shell\0\0\0\0\0\0");
 
     // Notify init (PID 1) that the shell is alive.
     syscall::notify(1, 0x5348454C_4C524459); // "SHELLRDY" as two u32s

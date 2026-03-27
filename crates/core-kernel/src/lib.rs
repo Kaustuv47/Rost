@@ -7,6 +7,7 @@ extern crate alloc;
 pub mod acpi;
 pub mod boot_info;
 pub mod crash_log;
+pub mod elf_spawn;
 pub mod hpet;
 pub mod stack_guard;
 pub mod iommu;

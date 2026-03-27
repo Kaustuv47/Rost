@@ -33,6 +33,7 @@ const HPET_OFF_BLOCK_ID:    usize = 36; // u32 — Event Timer Block ID
 //   +4  u64 Address
 const HPET_OFF_GAS_ADDR_SPACE:  usize = 40; // u8
 const HPET_OFF_GAS_ADDRESS:     usize = 44; // u64 — HPET MMIO base address
+#[allow(dead_code)]
 const HPET_OFF_SEQUENCE:        usize = 52; // u8  — HPET block sequence number
 // Minimum valid table length: 36 (SDT) + 4 (block_id) + 12 (GAS) + 4 = 56
 const HPET_MIN_LEN: usize = 56;
@@ -97,6 +98,25 @@ pub struct HpetInfo {
 /// table, or `None` if the RSDP is invalid or the platform has no HPET.
 pub fn find_hpet(rsdp_phys: u64) -> Option<u64> {
     find_table(rsdp_phys, b"HPET")
+}
+
+/// Extract only the HPET MMIO base address from the ACPI HPET table.
+///
+/// Reads the GAS.Address field at offset 44 from the ACPI table without
+/// accessing the HPET MMIO registers.  This is used by the caller to map
+/// the MMIO page before calling `parse_hpet()`, which reads the live GCI
+/// register to obtain the counter clock period.
+///
+/// Returns `None` if `hpet_phys` is zero, the signature is wrong, or the
+/// GAS.Address field is zero.
+pub fn hpet_mmio_base(hpet_phys: u64) -> Option<u64> {
+    if hpet_phys == 0 { return None; }
+    let base = hpet_phys as *const u8;
+    let sig = unsafe { core::slice::from_raw_parts(base.add(HPET_OFF_SIGNATURE), 4) };
+    if sig != b"HPET" { return None; }
+    let addr = unsafe { read_u64(base.add(HPET_OFF_GAS_ADDRESS)) };
+    if addr == 0 { return None; }
+    Some(addr)
 }
 
 /// Parse the HPET table at `hpet_phys` and return an [`HpetInfo`].
