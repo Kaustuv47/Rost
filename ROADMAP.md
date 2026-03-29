@@ -482,7 +482,7 @@ is a security and safety violation.
       — audit_entries() returns a snapshot Vec for shell inspection
 [x] Full 72-byte IPC message over SYS_RECV_MSG / SYS_SEND_MSG
       — 8 × u64 payload; user buffer pointer; kernel stamps sender PID
-      — used by VFS server ↔ shell for filesystem IPC (OP_READDIR, OP_READ, OP_STAT, OP_MOUNT)
+      — used by VFS server ↔ shell for filesystem IPC (OP_READDIR, OP_READ, OP_STAT, OP_MOUNT, OP_WRITE_OPEN, OP_WRITE_DATA, OP_WRITE_CLOSE, OP_MKDIR, OP_UNLINK)
 [x] Capability-based endpoints   (see §6 — replaces raw-PID addressing)
       — SYS_CHAN_BIND (20): allocates CapKind::Channel slot pointing to target PID;
         caller holds a send token without needing to know the raw PID at send time
@@ -1061,59 +1061,103 @@ Implemented as a full zsh-compatible shell — the default interactive shell for
       log                — crash log location / format info
       ls [path]          — list directory via VFS OP_READDIR (colour-coded)
       mem                — physical memory layout summary
+      mkdir <path>       — create a directory in the mutable VFS overlay (OP_MKDIR)
       mount              — display VFS mount table via OP_MOUNT
       ps                 — list well-known PIDs; shows own PID
       pwd                — print working directory
+      rm <path>          — remove a mutable file or directory (OP_UNLINK)
       set                — list all shell variables (alias for env)
       sleep <n>          — sleep n seconds (SYS_RECV timeout = n × 100 ticks)
       source <file> / .  — read and execute script from VFS (up to 2 KB)
       test EXPR / [ ]    — -f/-d/-z/-n FILE; A = B; A != B; -eq/-ne/-lt/-le/-gt/-ge
+      touch <path>       — create empty file in the mutable VFS overlay (OP_WRITE_OPEN/CLOSE)
       true               — return exit code 0
       type <cmd>         — show whether cmd is builtin, alias, or not found
       unalias <name>     — remove alias
       unset <name>       — remove variable
       uptime             — show h/m/s uptime via SYS_CLOCK
       which <cmd>        — builtin/alias check; VFS /bin lookup via OP_STAT
+      write <path> <text...>  — write space-joined args (+ newline) to a mutable file
 
 [x] exec <path>   — read ELF from VFS, call SYS_SPAWN_ELF (26), print new PID
                      — /bin/hello (hello-world demo binary) is embedded in the VFS
                      — 512 KB static EXEC_BUF in shell BSS; ELF magic validated before spawn
-[ ] ps command    — full process list requires kernel process-table IPC extension
+[x] ps command    — SYS_LIST_PROCS (28) snapshots kernel process table; 24 B/entry
 ```
 
 ---
 
 ### 17  VFS Server  (servers/vfs)
 
-Virtual filesystem IPC server; runs as ring-3 ELF binary (PID 3 by convention).
+Virtual filesystem IPC server; runs as ring-3 ELF binary (PID 4 by convention).
 
 ```
 [x] Ring-3 ELF binary   (x86_64-unknown-none, servers/vfs workspace)
 [x] IPC dispatch loop   (SYS_RECV_MSG + SYS_SEND_MSG; blocks until request arrives)
-[x] OP_READDIR (0x20)   — list directory entries; RESP_ENTRY per child + RESP_DONE
-[x] OP_READ    (0x22)   — read file chunk (stateless: client passes path + offset each call)
-[x] OP_STAT    (0x23)   — query flags (is_dir, executable) + size for a path
-[x] OP_MOUNT   (0x24)   — enumerate mount table; RESP_MOUNT per entry + RESP_DONE
+[x] OP_READDIR    (0x20) — list directory entries; RESP_ENTRY per child + RESP_DONE
+                           — static children emitted first; mutable entries that shadow a
+                             static name are de-duplicated (mutable version wins)
+[x] OP_READ       (0x22) — stateless read: client passes path + byte offset each call
+                           — mutable overlay checked first; falls back to static tree
+[x] OP_STAT       (0x23) — query flags (is_dir, executable) + size for a path
+                           — mutable overlay checked first; falls back to static tree
+[x] OP_MOUNT      (0x24) — enumerate mount table; RESP_MOUNT per entry + RESP_DONE
+[x] OP_WRITE_OPEN (0x25) — open/create file for streaming write; truncates existing content
+                           — allocates slot in mutable overlay; RESP_OK or RESP_ERROR
+[x] OP_WRITE_DATA (0x26) — stream a 40-byte chunk into the open write session
+                           — data[1]=chunk_len, data[2..8]=bytes (little-endian packed)
+[x] OP_WRITE_CLOSE(0x27) — finalise and close the write session; RESP_OK
+[x] OP_MKDIR      (0x28) — create a directory in the mutable overlay; RESP_OK or RESP_ERROR
+[x] OP_UNLINK     (0x29) — remove a mutable entry; closes stale fds on that path; RESP_OK
+[x] OP_OPEN       (0x30) — open a file descriptor (stateful, VFS tracks position)
+                           — oflags: O_RDONLY=0, O_WRONLY=1, O_RDWR=2 | O_CREAT=4 | O_TRUNC=8 | O_APPEND=16
+                           — reply: RESP_FD(fd_num) or RESP_ERROR(ENOENT/ENOSPC/EMFILE/EACCES/EISDIR)
+[x] OP_CLOSE      (0x31) — close a file descriptor; RESP_OK or RESP_ERROR(EBADF)
+[x] OP_READ_FD    (0x32) — read next CHUNK_SIZE bytes via fd; VFS advances offset
+                           — reply: RESP_DATA or RESP_DONE (EOF) or RESP_ERROR
+[x] OP_WRITE_FD   (0x33) — write up to 40 bytes via fd; VFS advances offset
+                           — data[1]=fd, data[2]=chunk_len, data[3..8]=bytes
+                           — O_APPEND writes always go to end of file regardless of offset
+[x] OP_SEEK       (0x34) — set fd offset to absolute byte position; RESP_OK or RESP_ERROR(EBADF)
+[x] OP_FSTAT      (0x35) — stat an open fd; same RESP_STAT reply as OP_STAT
 [x] IPC protocol (proto.rs)
-      — opcodes 0x20–0x24; responses 0x80–0x8F
+      — stateless opcodes 0x20–0x29; stateful fd opcodes 0x30–0x35
+      — responses 0x80–0x8F; RESP_OK=0x85, RESP_FD=0x86
       — PATH_BYTES=48 (data[2..8]); CHUNK_SIZE=40 (data[3..8]); NAME_BYTES=40
-      — errno: ENOENT=1, ENOTDIR=2, EISDIR=3, ENOSYS=4
+      — errno: ENOENT=1, ENOTDIR=2, EISDIR=3, ENOSYS=4, ENOSPC=5, EBADF=6, EMFILE=7, EACCES=8
 [x] Static RAM filesystem (fs.rs)
-      — /bin/hello (ELF magic stub, executable flag)
-      — /etc/{hosts, motd, passwd}
-      — /home/user/{notes.txt, readme.txt}
-      — /root/.profile
-      — /var/log/ (empty directory)
-      — /motd.txt, /version.txt
+      — /bin/hello (ELF stub, executable), /etc/{hosts,motd,passwd}
+      — /home/user/{notes.txt, readme.txt}, /root/.profile
+      — /var/log/ (empty directory), /motd.txt, /version.txt
       — lookup(path): splits on '/', trims nulls, walks DirEntry tree
+[x] Mutable RAM-disk overlay (mutable.rs)
+      — 32 nodes × 4096 B ≈ 131 KB BSS; heap-free, fixed-size
+      — MutNode { path[64], plen, flags, dlen, used, data[4096] }
+      — API: find(), alloc(), remove(), write_chunk(), truncate(), get(), children_of()
+      — Mutable entries shadow same-path static entries in READ/STAT/READDIR
+[x] File descriptor table (fd.rs)
+      — 256 slots (8 fds × 32 processes) ≈ 20 KB BSS; heap-free
+      — FdEntry { pid, fd, oflags, offset, path[64], plen, used }
+      — API: alloc(), get(), advance(), seek(), free(), free_all(), free_all_path()
+      — free_all_path() closes stale fds when a file is unlinked
 [x] Mount table
       — MountPoint { path: b"/", fstype: b"ramfs", source: b"ramdisk:0" }
-
-[ ] Writable files  (currently read-only; requires mutable Node + physical backing)
-[ ] Block device backend  (forward reads to a block-drv server instead of static data)
-[ ] FAT32 parser   (read files from virtio-blk / IDE disk image)
-[ ] File descriptor table  (per-process open-file state managed by VFS server)
-[ ] sys_open / sys_read / sys_write / sys_close  (POSIX-style fd API over IPC)
+[x] Block device IPC client (blk.rs)
+      — lazy-resolves "block-drv" PID via SYS_LOOKUP; cached after first probe
+      — read_sector(lba, buf): up to 13 synchronous SYS_CALL round-trips per 512-byte sector
+      — protocol: OP_BLK_READ(0x50) request, RESP_BLK_DATA(0x90) reply, 40 B per chunk
+      — available() returns false if no block-drv registered → VFS silent fallback to static tree
+[x] FAT32 parser (fat32.rs)
+      — parses BPB from sector 0; validates jump-boot sig + extended boot sig (0x28/0x29)
+      — single-sector FAT cache + single-sector cluster-data cache (~1 KB BSS total)
+      — cluster chain traversal via fat_next() with FAT sector caching
+      — 8.3 short filenames + LFN (Long File Name) entries, up to 255 chars
+      — case-insensitive path component matching
+      — public API: available(), lookup(path), readdir(path, cb), read_file(path, offset, buf)
+[x] Three-layer storage priority in all read operations
+      — mutable overlay > FAT32 > static ROM tree
+      — READDIR: SeenNames dedup struct (32 × 40 B on stack) prevents duplicate entries
+      — READ / STAT / FSTAT / OP_READ_FD: mutable checked first, then FAT32, then static
 ```
 
 ---

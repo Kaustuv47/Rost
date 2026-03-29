@@ -36,17 +36,25 @@ static mut EXEC_BUF: [u8; EXEC_BUF_CAP] = [0u8; EXEC_BUF_CAP];
 const VFS_PID:    u64 = 4;
 const VFS_TIMEOUT: u64 = 100;
 
-const OP_READDIR: u64 = 0x20;
-const OP_READ:    u64 = 0x22;
-const OP_STAT:    u64 = 0x23;
-const OP_MOUNT:   u64 = 0x24;
+const OP_READDIR:    u64 = 0x20;
+const OP_READ:       u64 = 0x22;
+const OP_STAT:       u64 = 0x23;
+const OP_MOUNT:      u64 = 0x24;
+const OP_WRITE_OPEN: u64 = 0x25;
+const OP_WRITE_DATA: u64 = 0x26;
+const OP_WRITE_CLOSE:u64 = 0x27;
+const OP_MKDIR:      u64 = 0x28;
+const OP_UNLINK:     u64 = 0x29;
 
 const RESP_ENTRY: u64 = 0x80;
 const RESP_DONE:  u64 = 0x81;
 const RESP_DATA:  u64 = 0x82;
 const RESP_STAT:  u64 = 0x83;
 const RESP_MOUNT: u64 = 0x84;
+const RESP_OK:    u64 = 0x85;
 const RESP_ERROR: u64 = 0x8F;
+
+const CHUNK_SIZE: usize = 40;
 
 // ── Sorted command registry (binary-search tab-completion) ────────────────────
 
@@ -69,18 +77,22 @@ const COMMANDS: &[&[u8]] = &[
     b"log",
     b"ls",
     b"mem",
+    b"mkdir",
     b"mount",
     b"ps",
     b"pwd",
+    b"rm",
     b"set",
     b"sleep",
     b"source",
+    b"touch",
     b"true",
     b"type",
     b"unalias",
     b"unset",
     b"uptime",
     b"which",
+    b"write",
 ];
 
 // ── Public action type ────────────────────────────────────────────────────────
@@ -385,21 +397,25 @@ fn dispatch(line: &[u8], ctx: &mut ExecCtx<'_>) -> (Action, u64) {
         b"log"     => { cmd_log(); 0 }
         b"ls"      => { cmd_ls(&args, ctx.cwd); 0 }
         b"mem"     => { cmd_mem(); 0 }
+        b"mkdir"   => { cmd_mkdir(&args, ctx.cwd) }
         b"mount"   => { cmd_mount(); 0 }
         b"ps"      => { cmd_ps(ctx.pid); 0 }
         b"pwd"     => { cmd_pwd(ctx.cwd); 0 }
+        b"rm"      => { cmd_rm(&args, ctx.cwd) }
         b"set"     => { cmd_set(ctx.vars); 0 }
         b"sleep"   => { cmd_sleep(&args); 0 }
         b"source" | b"." => {
             let (a, c) = cmd_source(&args, ctx);
             return (a, c);
         }
+        b"touch"   => { cmd_touch(&args, ctx.cwd) }
         b"true"    => 0,
         b"type"    => { cmd_type(&args, ctx.aliases); 0 }
         b"unalias" => { cmd_unalias(&args, ctx.aliases); 0 }
         b"unset"   => { cmd_unset(&args, ctx.vars); 0 }
         b"uptime"  => { cmd_uptime(); 0 }
         b"which"   => { cmd_which(&args, ctx.aliases); 0 }
+        b"write"   => { cmd_write(&args, ctx.cwd) }
         b"["       => { cmd_test_bracket(&args, ctx.cwd) }
         b"test"    => { cmd_test(&args, ctx.cwd) }
         _ => {
@@ -580,12 +596,15 @@ fn cmd_help() {
     serial::print_str("  log                show crash log info\n");
     serial::print_str("  ls [path]          list directory\n");
     serial::print_str("  mem                show memory info\n");
+    serial::print_str("  mkdir <path>       create a directory\n");
     serial::print_str("  mount              show mount table\n");
     serial::print_str("  ps                 list processes\n");
     serial::print_str("  pwd                print working directory\n");
+    serial::print_str("  rm <path>          remove a mutable file or directory\n");
     serial::print_str("  set                list all shell variables\n");
     serial::print_str("  sleep <n>          sleep n seconds\n");
     serial::print_str("  source <file>      execute script from VFS\n");
+    serial::print_str("  touch <path>       create empty file\n");
     serial::print_str("  test EXPR          evaluate expression (see below)\n");
     serial::print_str("  true               return exit code 0\n");
     serial::print_str("  type <cmd>         show type of command\n");
@@ -593,6 +612,7 @@ fn cmd_help() {
     serial::print_str("  unset <name>       remove variable\n");
     serial::print_str("  uptime             show uptime\n");
     serial::print_str("  which <cmd>        show command location\n");
+    serial::print_str("  write <path> <text>  write text to a file\n");
     serial::print_str("\n\x1b[1mLine editing (emacs mode):\x1b[0m\n");
     serial::print_str("  Ctrl+A/E           beginning / end of line\n");
     serial::print_str("  Ctrl+B/F           backward / forward char\n");
@@ -917,6 +937,170 @@ fn cmd_mem() {
     serial::print_str("  Kernel heap:  1 MB static BSS array\n");
     serial::print_str("  Pool:         512 × 4 KB page-table frames\n");
     serial::print_str("(detailed stats require kernel IPC extension)\n");
+}
+
+// ── VFS write helpers ─────────────────────────────────────────────────────────
+
+/// Pack up to CHUNK_SIZE bytes from `src` into 6 little-endian-packed u64 words.
+fn pack_data_words(src: &[u8], words: &mut [u64; 6]) {
+    for (i, &b) in src.iter().enumerate().take(CHUNK_SIZE) {
+        words[i / 8] |= (b as u64) << ((i % 8) * 8);
+    }
+}
+
+/// Stream `data` into VFS at `path` using WRITE_OPEN / WRITE_DATA / WRITE_CLOSE.
+///
+/// Returns `true` on success.
+fn vfs_write_file(path: &[u8], flags: u8, data: &[u8]) -> bool {
+    let (pw, _) = path_as_words(path);
+
+    // WRITE_OPEN
+    let mut req = Msg::zeroed();
+    req.data[0] = OP_WRITE_OPEN;
+    req.data[1] = flags as u64;
+    req.data[2..8].copy_from_slice(&pw);
+    if !send_msg(VFS_PID, &req) { return false; }
+    let mut resp = Msg::zeroed();
+    if !recv_msg(VFS_TIMEOUT, &mut resp) || resp.data[0] != RESP_OK { return false; }
+
+    // WRITE_DATA — send CHUNK_SIZE bytes per message
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let end = (offset + CHUNK_SIZE).min(data.len());
+        let chunk = &data[offset..end];
+        let mut words = [0u64; 6];
+        pack_data_words(chunk, &mut words);
+        let mut req = Msg::zeroed();
+        req.data[0] = OP_WRITE_DATA;
+        req.data[1] = chunk.len() as u64;
+        req.data[2..8].copy_from_slice(&words);
+        if !send_msg(VFS_PID, &req) { return false; }
+        let mut resp = Msg::zeroed();
+        if !recv_msg(VFS_TIMEOUT, &mut resp) || resp.data[0] != RESP_OK { return false; }
+        offset = end;
+    }
+
+    // WRITE_CLOSE
+    let mut req = Msg::zeroed();
+    req.data[0] = OP_WRITE_CLOSE;
+    if !send_msg(VFS_PID, &req) { return false; }
+    let mut resp = Msg::zeroed();
+    recv_msg(VFS_TIMEOUT, &mut resp) && resp.data[0] == RESP_OK
+}
+
+fn cmd_touch(args: &Args<'_>, cwd: &[u8]) -> u64 {
+    let raw = args.get(1);
+    if raw.is_empty() {
+        serial::print_str("usage: touch <path>\n");
+        return 1;
+    }
+    let (res_buf, res_len) = resolve(cwd, raw);
+    if vfs_write_file(&res_buf[..res_len], 0, b"") {
+        0
+    } else {
+        serial::print_str("touch: failed (table full or path error)\n");
+        1
+    }
+}
+
+fn cmd_mkdir(args: &Args<'_>, cwd: &[u8]) -> u64 {
+    let raw = args.get(1);
+    if raw.is_empty() {
+        serial::print_str("usage: mkdir <path>\n");
+        return 1;
+    }
+    let (res_buf, res_len) = resolve(cwd, raw);
+    let (pw, _) = path_as_words(&res_buf[..res_len]);
+
+    let mut req = Msg::zeroed();
+    req.data[0] = OP_MKDIR;
+    req.data[1] = 0;
+    req.data[2..8].copy_from_slice(&pw);
+    if !send_msg(VFS_PID, &req) {
+        serial::print_str("mkdir: failed to reach VFS\n");
+        return 1;
+    }
+    let mut resp = Msg::zeroed();
+    if !recv_msg(VFS_TIMEOUT, &mut resp) {
+        serial::print_str("mkdir: VFS timeout\n");
+        return 1;
+    }
+    match resp.data[0] {
+        RESP_OK    => 0,
+        RESP_ERROR => {
+            serial::print_str("mkdir: ");
+            match resp.data[1] {
+                5 => serial::print_str("no space left\n"),
+                _ => serial::print_str("error\n"),
+            }
+            1
+        }
+        _ => { serial::print_str("mkdir: unexpected response\n"); 1 }
+    }
+}
+
+fn cmd_rm(args: &Args<'_>, cwd: &[u8]) -> u64 {
+    let raw = args.get(1);
+    if raw.is_empty() {
+        serial::print_str("usage: rm <path>\n");
+        return 1;
+    }
+    let (res_buf, res_len) = resolve(cwd, raw);
+    let (pw, _) = path_as_words(&res_buf[..res_len]);
+
+    let mut req = Msg::zeroed();
+    req.data[0] = OP_UNLINK;
+    req.data[2..8].copy_from_slice(&pw);
+    if !send_msg(VFS_PID, &req) {
+        serial::print_str("rm: failed to reach VFS\n");
+        return 1;
+    }
+    let mut resp = Msg::zeroed();
+    if !recv_msg(VFS_TIMEOUT, &mut resp) {
+        serial::print_str("rm: VFS timeout\n");
+        return 1;
+    }
+    match resp.data[0] {
+        RESP_OK    => 0,
+        RESP_ERROR => {
+            serial::print_str("rm: ");
+            for &b in raw { serial::put_byte(b); }
+            match resp.data[1] {
+                1 => serial::print_str(": no such file or directory\n"),
+                _ => serial::print_str(": error\n"),
+            }
+            1
+        }
+        _ => { serial::print_str("rm: unexpected response\n"); 1 }
+    }
+}
+
+/// write <path> <word1> [word2 ...] — write space-joined args as text to a file.
+fn cmd_write(args: &Args<'_>, cwd: &[u8]) -> u64 {
+    if args.count < 2 {
+        serial::print_str("usage: write <path> <text...>\n");
+        return 1;
+    }
+    let raw = args.get(1);
+    let (res_buf, res_len) = resolve(cwd, raw);
+
+    // Assemble text from remaining args into a 4096-byte buffer.
+    let mut text = [0u8; 4096];
+    let mut tlen = 0usize;
+    for i in 2..args.count {
+        if i > 2 && tlen < text.len() { text[tlen] = b' '; tlen += 1; }
+        for &b in args.items[i] {
+            if tlen < text.len() { text[tlen] = b; tlen += 1; }
+        }
+    }
+    if tlen < text.len() { text[tlen] = b'\n'; tlen += 1; }
+
+    if vfs_write_file(&res_buf[..res_len], 0, &text[..tlen]) {
+        0
+    } else {
+        serial::print_str("write: failed (table full or path error)\n");
+        1
+    }
 }
 
 fn cmd_exec(args: &Args<'_>, cwd: &[u8]) {

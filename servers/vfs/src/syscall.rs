@@ -97,6 +97,45 @@ pub fn register(name: &[u8]) -> bool {
     ret == 0
 }
 
+/// Look up a service name in the kernel registry.
+/// Returns the PID, or `u64::MAX` if not registered.
+#[inline]
+pub fn lookup(name: &[u8]) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax")      11u64,
+            in("rdi")      name.as_ptr() as u64,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Synchronous IPC: send a Message and block until the recipient replies.
+/// On return `msg` contains the reply.  Returns `true` on success.
+#[inline]
+pub fn call(to_pid: u64, msg: &mut Msg) -> bool {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax")      17u64,
+            in("rdi")      to_pid,
+            in("rsi")      msg as *mut Msg as u64,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret == 0
+}
+
 /// Send a full Message.  The kernel overwrites msg.sender with our PID.
 /// Returns `true` on success.
 #[inline]
