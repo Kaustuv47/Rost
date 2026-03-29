@@ -596,6 +596,66 @@ impl Scheduler {
         Some((old_ctx, new_ctx, new_pml4, new_kern_rsp))
     }
 
+    /// Called from a device IRQ handler after unblocking a high-priority driver.
+    ///
+    /// Immediately preempts the running process if a higher-priority Ready
+    /// process now exists — without advancing the tick counter (that is the
+    /// timer ISR's exclusive job).
+    ///
+    /// Follows the same return convention as `timer_tick`:
+    /// `Some((old_ctx, new_ctx, new_pml4, new_kernel_rsp))` triggers a
+    /// context switch via `switch_context_noints` in the caller.
+    pub fn reschedule_isr(
+        &self,
+    ) -> Option<(*mut TaskContext, *const TaskContext, u64, u64)> {
+        let current_pid = *self.current_process.borrow();
+
+        // Pick highest-priority Ready process (returns None if none ready).
+        let next_pid = self.pick_next_priority()?;
+
+        // Only preempt when next is strictly higher priority (lower number).
+        let should_switch = {
+            let mut table = self.process_table.borrow_mut();
+            let cur_prio = current_pid
+                .and_then(|p| table.get_process(p))
+                .map(|pcb| pcb.priority)
+                .unwrap_or(255);
+            let next_prio = table
+                .get_process(next_pid)
+                .map(|pcb| pcb.priority)
+                .unwrap_or(255);
+            next_prio < cur_prio
+        }; // borrow dropped
+
+        if !should_switch || Some(next_pid) == current_pid {
+            return None;
+        }
+
+        *self.current_process.borrow_mut() = Some(next_pid);
+        let mut table = self.process_table.borrow_mut();
+
+        let old_ctx = current_pid.and_then(|cpid| {
+            table.get_process(cpid).map(|pcb| {
+                if matches!(pcb.state, ProcessState::Running) {
+                    pcb.state = ProcessState::Ready;
+                }
+                &mut pcb.context as *mut TaskContext
+            })
+        })?;
+
+        let (new_ctx, new_pml4, kern_rsp) =
+            table.get_process(next_pid).map(|pcb| {
+                pcb.state = ProcessState::Running;
+                (
+                    &pcb.context as *const TaskContext,
+                    pcb.page_table_base,
+                    pcb.kernel_rsp,
+                )
+            })?;
+
+        Some((old_ctx, new_ctx, new_pml4, kern_rsp))
+    }
+
     /// Mark the current process as Ready and exhaust its quantum so the next
     /// `timer_tick` triggers a context switch.  Used by SYS_YIELD.
     pub fn yield_current(&self) {

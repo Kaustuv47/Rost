@@ -466,7 +466,6 @@ unexpected_stub!(unexpected_vec31, 31);
 unexpected_stub!(unexpected_vec33, 33);
 unexpected_stub!(unexpected_vec34, 34);
 unexpected_stub!(unexpected_vec35, 35);
-unexpected_stub!(unexpected_vec36, 36);
 unexpected_stub!(unexpected_vec37, 37);
 unexpected_stub!(unexpected_vec38, 38);
 unexpected_stub!(unexpected_vec39, 39);
@@ -583,6 +582,87 @@ unexpected_stub!(unexpected_vec248,248);  unexpected_stub!(unexpected_vec249,249
 unexpected_stub!(unexpected_vec250,250);  unexpected_stub!(unexpected_vec251,251);
 unexpected_stub!(unexpected_vec252,252);  unexpected_stub!(unexpected_vec253,253);
 unexpected_stub!(unexpected_vec254,254);
+
+// ── COM1 UART RX ISR (IRQ4, vector 36) ───────────────────────────────────────
+//
+// Drain all received bytes from the FIFO and deliver each one to the
+// uart-drv process via IPC.  Follows the same naked-stub + inner-function
+// pattern as the timer ISR so that a context switch to uart-drv can happen
+// immediately (before the next 10 ms timer tick).
+//
+// EOI order: drain FIFO first (clears the UART interrupt), then send EOI to
+// the master PIC so no further IRQ4 is lost during processing.
+
+/// Inner handler: drains RX FIFO and enqueues one IPC message per byte.
+extern "C" fn handle_uart_rx() {
+    if !hal::uart::rx_irq_pending() {
+        return; // Spurious; nothing to do.
+    }
+
+    let drv_pid = core_kernel::uart_irq::get_uart_drv_pid();
+    if drv_pid == u32::MAX {
+        // uart-drv not yet registered — discard bytes to clear the interrupt.
+        hal::uart::drain_rx_fifo(|_| {});
+        return;
+    }
+
+    if let Some(sched) = core_kernel::scheduler::get_global() {
+        let from = core_kernel::process::ProcessId::new(0); // kernel pseudo-PID
+        let to   = core_kernel::process::ProcessId::new(drv_pid);
+
+        hal::uart::drain_rx_fifo(|byte| {
+            let mut msg = core_kernel::ipc::Message::new(from);
+            msg.set_data(0, 0x02); // OP_UART_RX
+            msg.set_data(1, byte as u64);
+            sched.send_message(from, to, msg);
+        });
+    }
+}
+
+/// Naked ISR stub for vector 36 (IRQ4 — COM1).
+///
+/// Saves caller-saved GPRs, drains the FIFO, sends EOI, then calls
+/// `uart_rx_isr()` which may context-switch to uart-drv immediately.
+#[unsafe(naked)]
+pub unsafe extern "C" fn uart_rx_handler() {
+    core::arch::naked_asm!(
+        // ── 1. Save caller-saved registers ──────────────────────────────────
+        "push rax", "push rcx", "push rdx",
+        "push rdi", "push rsi",
+        "push r8",  "push r9", "push r10", "push r11",
+
+        // ── 2. Drain FIFO and deliver bytes to uart-drv via IPC ─────────────
+        "sub  rsp, 8",
+        "call {deliver}",
+        "add  rsp, 8",
+
+        // ── 3a. EOI to master PIC (IRQ4 is on master, no slave EOI needed) ──
+        "mov  al, 0x20",
+        "out  0x20, al",
+
+        // ── 3b. EOI to LAPIC (if initialised) ────────────────────────────────
+        "mov  rax, qword ptr [{eoi_addr}]",
+        "test rax, rax",
+        "jz   2f",
+        "mov  dword ptr [rax], 0",
+        "2:",
+
+        // ── 4. Reschedule if uart-drv has higher priority than current ───────
+        "sub  rsp, 8",
+        "call {sched}",
+        "add  rsp, 8",
+
+        // ── 5+6. Restore and IRET (may now be a different process) ───────────
+        "pop  r11", "pop  r10", "pop  r9", "pop  r8",
+        "pop  rsi", "pop  rdi",
+        "pop  rdx", "pop  rcx", "pop  rax",
+        "iretq",
+
+        deliver  = sym handle_uart_rx,
+        eoi_addr = sym LAPIC_EOI_ADDR,
+        sched    = sym crate::cpu::uart_rx_isr,
+    );
+}
 
 // ── Timer ISR (IRQ0, vector 32) ───────────────────────────────────────────────
 //

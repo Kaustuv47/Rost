@@ -224,3 +224,25 @@ pub fn tick_scheduler_isr() {
         }
     }
 }
+
+/// Called from the COM1 IRQ4 naked stub after EOI and FIFO drain.
+///
+/// Immediately switches to a higher-priority process if `reschedule_isr`
+/// finds one (e.g., uart-drv just became Ready after receiving a byte).
+/// Re-arms the LAPIC one-shot timer before any context switch so the
+/// periodic tick heartbeat is not disrupted.
+pub fn uart_rx_isr() {
+    if let Some(sched) = core_kernel::scheduler::get_global() {
+        if let Some((old, new, pml4, kernel_rsp)) = sched.reschedule_isr() {
+            if let Some(pid) = sched.current_process() {
+                core_kernel::scheduler::CURRENT_PID
+                    .store(pid.as_u32(), core::sync::atomic::Ordering::Relaxed);
+            }
+            crate::apic::lapic::arm_oneshot(1);
+            unsafe {
+                tss::set_rsp0(kernel_rsp);
+                crate::context::switch_context_noints(old, new, pml4);
+            }
+        }
+    }
+}

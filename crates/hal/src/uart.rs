@@ -13,7 +13,7 @@ unsafe fn inb(port: u16) -> u8 {
 /// Initialize COM1 at 115200 baud, 8N1
 pub fn init() {
     unsafe {
-        outb(COM1 + 1, 0x00); // Disable interrupts
+        outb(COM1 + 1, 0x01); // Enable RX-ready interrupt (IER bit 0 = ERBFI)
         outb(COM1 + 3, 0x80); // Enable DLAB
         outb(COM1 + 0, 0x01); // Baud divisor low  (115200)
         outb(COM1 + 1, 0x00); // Baud divisor high
@@ -81,5 +81,26 @@ pub fn print_hex(val: u64) {
     for i in (0..16).rev() {
         let digit = ((val >> (i * 4)) & 0xF) as usize;
         put_byte(hex_chars[digit]);
+    }
+}
+
+/// Returns `true` if the IIR indicates a received-data interrupt is pending.
+///
+/// IIR bit 0 = 0 means "interrupt pending"; the interrupt type in bits[3:1]
+/// must be 0b100 (received data available) or 0b110 (receiver line status).
+pub fn rx_irq_pending() -> bool {
+    unsafe { inb(COM1 + 2) & 0x01 == 0 }
+}
+
+/// Drain all bytes currently in the RX FIFO, calling `cb` for each byte.
+///
+/// Uses LSR bit 0 (Data Ready) to detect available bytes.  Stops as soon
+/// as the FIFO is empty.  Bounded to 16 iterations (FIFO depth of 16550A).
+pub fn drain_rx_fifo(mut cb: impl FnMut(u8)) {
+    unsafe {
+        for _ in 0..16 {
+            if inb(COM1 + 5) & 0x01 == 0 { break; } // LSR DR bit
+            cb(inb(COM1));
+        }
     }
 }

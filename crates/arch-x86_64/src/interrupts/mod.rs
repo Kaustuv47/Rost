@@ -28,6 +28,7 @@ pub fn init(idt: &mut InterruptDescriptorTable) {
     idt.set_entry(14, IdtEntry::interrupt_gate(page_fault_handler               as *const () as u64, 0x08));
     idt.set_entry(18, IdtEntry::interrupt_gate_ist(machine_check_handler        as *const () as u64, 0x08, 3));
     idt.set_entry(32, IdtEntry::interrupt_gate(timer_interrupt_handler          as *const () as u64, 0x08));
+    idt.set_entry(36, IdtEntry::interrupt_gate(uart_rx_handler                  as *const () as u64, 0x08));
     idt.set_entry(255, IdtEntry::interrupt_gate(spurious_handler                as *const () as u64, 0x08));
 
     // ── Catch-all for every other vector ─────────────────────────────────────
@@ -50,7 +51,7 @@ pub fn init(idt: &mut InterruptDescriptorTable) {
     fill!( 28, unexpected_vec28);  fill!( 29, unexpected_vec29);
     fill!( 30, unexpected_vec30);  fill!( 31, unexpected_vec31);
     fill!( 33, unexpected_vec33);  fill!( 34, unexpected_vec34);
-    fill!( 35, unexpected_vec35);  fill!( 36, unexpected_vec36);
+    fill!( 35, unexpected_vec35);
     fill!( 37, unexpected_vec37);  fill!( 38, unexpected_vec38);
     fill!( 39, unexpected_vec39);  fill!( 40, unexpected_vec40);
     fill!( 41, unexpected_vec41);  fill!( 42, unexpected_vec42);

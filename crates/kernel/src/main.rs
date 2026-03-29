@@ -734,6 +734,15 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
             );
         }
         arch_x86_64::apic::ioapic::init(ioapic_base);
+
+        // Route COM1 UART (ISA IRQ 4) to IDT vector 36 on BSP (LAPIC ID 0).
+        // ISA IRQ 4 sits on IOAPIC pin (4 - gsi_base); gsi_base is 0 on q35.
+        if ioapic_base != 0 {
+            let gsi_base = unsafe { IOAPIC_GSI_BASE };
+            let pin      = 4u32.saturating_sub(gsi_base) as u8;
+            unsafe { arch_x86_64::apic::ioapic::route_irq(ioapic_base, pin, 36, 0); }
+            hal::uart::print_str("      ├─ IOAPIC:          IRQ4(COM1) → vector 36\n");
+        }
     }
 
     // Intel VT-d IOMMU: enable passthrough DMA remapping (IEC 61508 §7.4.3).

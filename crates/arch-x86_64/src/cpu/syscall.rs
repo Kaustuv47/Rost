@@ -642,7 +642,12 @@ extern "sysv64" fn dispatch_syscall(
             if !validate_user_ptr(a0, 16, 1) { return EINVAL; }
             let pid = core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed);
             let name = unsafe { core::slice::from_raw_parts(a0 as *const u8, 16) };
-            if core_kernel::service_registry::register(name, pid) { 0 } else { EINVAL }
+            if !core_kernel::service_registry::register(name, pid) { return EINVAL; }
+            // Cache uart-drv PID for the COM1 IRQ4 handler (avoids name-scan in ISR).
+            if name.starts_with(b"uart-drv") {
+                core_kernel::uart_irq::set_uart_drv_pid(pid);
+            }
+            0
         }
 
         // SYS_LOOKUP — look up the PID for a named service.
