@@ -486,6 +486,7 @@ fn emit_prompt(cwd: &[u8]) {
 }
 
 fn print_prompt(editor: &LineEditor, cwd: &[u8]) {
+    serial::put_byte(b'\r');   // ensure cursor is at column 0 before printing prompt
     emit_prompt(cwd);
     for &b in editor.as_bytes() { serial::put_byte(b); }
     let back = editor.len - editor.cursor;

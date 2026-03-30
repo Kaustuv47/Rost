@@ -572,7 +572,7 @@ fn cmd_echo(args: &Args<'_>) {
         if i > start { serial::put_byte(b' '); }
         for &b in args.items[i] { serial::put_byte(b); }
     }
-    if newline { serial::put_byte(b'\n'); }
+    if newline { serial::put_newline(); }
 }
 
 fn cmd_help() {

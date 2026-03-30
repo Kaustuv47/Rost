@@ -971,6 +971,15 @@ Implemented as a full zsh-compatible shell — the default interactive shell for
 [x] CRLF absorber in escape parser (last_cr field)
       — terminal sends \r\n on Enter; \r → Key::Enter, subsequent \n absorbed silently
       — prevents double Enter events from CRLF terminal input
+[x] Raw-mode terminal guarantee (scripts/run.sh)
+      — QEMU wrapped with exec script -q /dev/null so it always sees a proper PTY
+      — guarantees QEMU's tcsetattr correctly sets raw mode regardless of how run.sh
+        is invoked (terminal, IDE run button, pipe, etc.)
+      — eliminates double-echo and spurious blank lines caused by cooked-mode buffering
+[x] Correct CRLF output from all shell commands
+      — cmd_echo uses put_newline() (\r\n) instead of bare put_byte(\n)
+      — print_prompt() prefixes \r to guarantee column-0 alignment after any command
+        that may leave the cursor mid-line (bare \n, partial output, etc.)
 [x] Interactive UART read loop
 
 [x] Full emacs-mode line editing
@@ -1173,11 +1182,15 @@ All drivers run in ring 3.  A driver crash cannot take down the kernel.
 [x] uart-drv server (PID 3 by convention)  — servers/uart-drv, spawned by kernel via ELF loader
       — registers as "uart-drv" via SYS_REGISTER(10) at startup
       — main loop: drain SYS_RECV_MSG(0) write requests (OP_WRITE=0x01) → SYS_UART_WRITE(12)
-      — polls SYS_UART_READ(13) for keystrokes → SYS_SEND to shell PID
+      — IRQ-driven RX: UART ISR (vector 36, via IOAPIC) drains COM1 FIFO and sends one
+          OP_UART_RX IPC message per byte to uart-drv; uart-drv forwards each byte to the
+          foreground shell via SYS_SEND — zero-latency input, no polling required
+      — IOAPIC routing: route_irq(ioapic_base, pin=4, vector=36, lapic=0) wires ISA IRQ4
+          (COM1) to the LAPIC at boot (main.rs Stage 3, after ioapic::init())
+      — uart_rx_isr() context-switches immediately to uart-drv after FIFO drain so
+          keystrokes reach the shell within one scheduler quantum
       — looks up shell PID via SYS_LOOKUP("rost-shell")
-      — blocks for 1 tick (SYS_RECV_MSG timeout=1) between polls to pace UART reads;
-        prevents duplicate byte delivery on QEMU HVF where register may not clear instantly
-      — priority 64 (equal to shell); shell gets CPU during uart-drv's 1-tick blocking window
+      — priority 64 (equal to shell)
 [ ] Block device driver   (ATA PIO or virtio-blk for QEMU)
 [ ] GOP framebuffer driver
       — maps framebuffer physical address via SYS_MAP
