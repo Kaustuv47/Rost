@@ -913,8 +913,11 @@ The first user-space process; owns the system lifecycle.
 [x] Shutdown request opcode
       — any process can send OP_SHUTDOWN (data[0]=0x00FF) to init
       — init logs the requester and calls ordered_shutdown()
-[ ] Expose boot log over IPC to diagnostic clients
-      — deferred: requires SYS_CALL (synchronous IPC) + a fixed-size log ring buffer
+[x] Expose boot log over IPC to diagnostic clients
+      — 16-entry ring buffer (LogBuf) in init; each entry: seq, timestamp_ns, 32-byte text
+      — OP_LOG_READ (0x0002) request via SYS_CALL(17) → init replies OP_LOG_READ_REPLY (0x8002)
+      — reply: data[0]=opcode, data[1]=seq, data[2]=next_seq, data[3]=ts, data[4..7]=text (4×u64)
+      — events logged: startup, service PID resolved, fault, restart ok/fail, heartbeat timeout
 [x] Process restart via SYS_RESTART_SERVER (27)
       — on fault notification, init calls SYS_RESTART_SERVER with the 16-byte service name
       — kernel hook (restart_server_hook) maps name → embedded ELF and calls spawn_elf

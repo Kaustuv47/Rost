@@ -45,6 +45,17 @@ mod syscall;
 /// Heartbeat opcode — servers send this periodically to prove they are alive.
 const OP_HEARTBEAT: u64 = 0x0001;
 
+/// Boot-log read request — any process can call SYS_CALL(init_pid, OP_LOG_READ, seq).
+///
+/// Request:  data[0] = OP_LOG_READ, data[1] = seq (entry to fetch, 0-based)
+/// Reply:    data[0] = OP_LOG_READ_REPLY
+///           data[1] = echoed seq
+///           data[2] = next_seq (total events logged; seq in [next_seq-16, next_seq) are valid)
+///           data[3] = timestamp_ns (0 when seq is out of range / no entry)
+///           data[4..7] = 32 bytes of message text packed little-endian into 4 x u64
+const OP_LOG_READ:       u64 = 0x0002;
+const OP_LOG_READ_REPLY: u64 = 0x8002;
+
 /// Shutdown request — any trusted process can ask init to start a clean shutdown.
 const OP_SHUTDOWN: u64 = 0x00FF;
 
@@ -85,6 +96,102 @@ impl ServiceEntry {
 const MAX_SERVICES: usize = 8;
 const HEARTBEAT_TIMEOUT_NS: u64 = 5_000_000_000; // 5 seconds
 
+// ── Boot log ring buffer ──────────────────────────────────────────────────────
+
+const LOG_ENTRIES: usize = 16;
+
+#[derive(Copy, Clone)]
+struct LogEntry {
+    seq:  u64,
+    ts:   u64,
+    text: [u8; 32],
+}
+
+impl LogEntry {
+    const fn zeroed() -> Self {
+        LogEntry { seq: u64::MAX, ts: 0, text: [0u8; 32] }
+    }
+}
+
+struct LogBuf {
+    entries:  [LogEntry; LOG_ENTRIES],
+    /// Next write position in the ring (0..LOG_ENTRIES).
+    write:    usize,
+    /// Number of valid entries currently stored (0..=LOG_ENTRIES).
+    count:    usize,
+    /// Sequence number to assign to the *next* entry.
+    next_seq: u64,
+}
+
+impl LogBuf {
+    const fn new() -> Self {
+        LogBuf {
+            entries: [LogEntry::zeroed(); LOG_ENTRIES],
+            write:    0,
+            count:    0,
+            next_seq: 0,
+        }
+    }
+
+    fn append(&mut self, ts: u64, text: &[u8]) {
+        let e = &mut self.entries[self.write];
+        e.seq = self.next_seq;
+        e.ts  = ts;
+        e.text = [0u8; 32];
+        let n = text.len().min(31);
+        e.text[..n].copy_from_slice(&text[..n]);
+        self.write = (self.write + 1) % LOG_ENTRIES;
+        if self.count < LOG_ENTRIES { self.count += 1; }
+        self.next_seq += 1;
+    }
+
+    /// Return the entry whose seq matches `seq`, if it is still in the ring.
+    fn get(&self, seq: u64) -> Option<&LogEntry> {
+        // Determine index of the oldest entry in the ring.
+        let oldest_idx = if self.count < LOG_ENTRIES {
+            0
+        } else {
+            self.write // write points at the slot *about to be overwritten* = oldest
+        };
+        for i in 0..self.count {
+            let idx = (oldest_idx + i) % LOG_ENTRIES;
+            if self.entries[idx].seq == seq {
+                return Some(&self.entries[idx]);
+            }
+        }
+        None
+    }
+}
+
+// ── Text-builder (no alloc / no format!) ─────────────────────────────────────
+
+struct TextBuf {
+    buf: [u8; 32],
+    pos: usize,
+}
+
+impl TextBuf {
+    fn new() -> Self { TextBuf { buf: [0u8; 32], pos: 0 } }
+
+    fn push(&mut self, s: &[u8]) {
+        for &b in s {
+            if self.pos >= 31 { break; }
+            self.buf[self.pos] = b;
+            self.pos += 1;
+        }
+    }
+
+    fn push_dec(&mut self, mut v: u64) {
+        if v == 0 { self.push(b"0"); return; }
+        let mut tmp = [0u8; 20];
+        let mut i = 20usize;
+        while v > 0 { i -= 1; tmp[i] = b'0' + (v % 10) as u8; v /= 10; }
+        self.push(&tmp[i..]);
+    }
+
+    fn as_bytes(&self) -> &[u8] { &self.buf[..self.pos] }
+}
+
 // ── Serial output helpers ─────────────────────────────────────────────────────
 
 fn print(s: &str) {
@@ -105,22 +212,35 @@ fn handle_msg(
     msg:       &mut syscall::Msg,
     services:  &mut [ServiceEntry],
     last_beat: &mut [u64; MAX_SERVICES],
+    log:       &mut LogBuf,
 ) {
     let op  = msg.data[0];
     let arg = msg.data[1];
 
     if op == FAULT_DE || op == FAULT_GP || op == FAULT_PF {
         let fault_pid = arg;
-        print("[init] FAULT ");
-        print(match op {
+        let fault_name = match op {
             FAULT_DE => "#DE(div-by-zero)",
             FAULT_GP => "#GP(general-protection)",
             FAULT_PF => "#PF(page-fault)",
             _        => "#??(unknown)",
-        });
+        };
+        print("[init] FAULT ");
+        print(fault_name);
         print(" in PID ");
         print_dec(fault_pid);
         print("\n");
+
+        // Append to boot log.
+        {
+            let ts = syscall::clock();
+            let mut t = TextBuf::new();
+            t.push(b"FAULT ");
+            t.push(fault_name.as_bytes());
+            t.push(b" pid=");
+            t.push_dec(fault_pid);
+            log.append(ts, t.as_bytes());
+        }
 
         // Find the matching service and attempt restart.
         let mut matched_idx: Option<usize> = None;
@@ -154,6 +274,14 @@ fn handle_msg(
                         print("[init] restarted -> PID ");
                         print_dec(new_pid as u64);
                         print("\n");
+
+                        let ts = syscall::clock();
+                        let mut t = TextBuf::new();
+                        t.push(b"RESTART OK pid=");
+                        t.push_dec(new_pid as u64);
+                        t.push(b" ");
+                        t.push(&name_str[..name_str.iter().position(|&c| c == 0).unwrap_or(name_str.len())]);
+                        log.append(ts, t.as_bytes());
                     }
                     None => {
                         print("[init] restart FAILED for ");
@@ -161,6 +289,13 @@ fn handle_msg(
                             syscall::uart_write(b);
                         }
                         print("\n");
+
+                        let ts = syscall::clock();
+                        let mut t = TextBuf::new();
+                        t.push(b"RESTART FAIL ");
+                        t.push(&name_str[..name_str.iter().position(|&c| c == 0).unwrap_or(name_str.len())]);
+                        log.append(ts, t.as_bytes());
+
                         if critical {
                             print("[init] CRITICAL service unrecoverable — halting\n");
                             ordered_shutdown();
@@ -175,6 +310,13 @@ fn handle_msg(
                 }
                 print("\n");
                 svc.pid = u64::MAX; // mark as gone so we stop reporting on it
+
+                let ts = syscall::clock();
+                let mut t = TextBuf::new();
+                t.push(b"BUDGET EXHAUSTED ");
+                t.push(&name_str[..name_str.iter().position(|&c| c == 0).unwrap_or(name_str.len())]);
+                log.append(ts, t.as_bytes());
+
                 if critical {
                     print("[init] CRITICAL service permanently down — initiating ordered shutdown\n");
                     ordered_shutdown();
@@ -192,6 +334,30 @@ fn handle_msg(
                 break;
             }
         }
+
+    } else if op == OP_LOG_READ {
+        // Diagnostic client asked for boot log entry at seq=arg.
+        // Reply via send_msg so the SYS_CALL(17) caller is unblocked.
+        let seq = arg;
+        let mut reply = syscall::Msg::zeroed();
+        reply.data[0] = OP_LOG_READ_REPLY;
+        reply.data[1] = seq;
+        reply.data[2] = log.next_seq; // one past the last valid seq
+
+        if let Some(e) = log.get(seq) {
+            reply.data[3] = e.ts;
+            // Pack 32 bytes of text into data[4..8] (4 × 8 bytes, little-endian).
+            for chunk in 0..4usize {
+                let off = chunk * 8;
+                let mut word = 0u64;
+                for byte_idx in 0..8usize {
+                    word |= (e.text[off + byte_idx] as u64) << (byte_idx * 8);
+                }
+                reply.data[4 + chunk] = word;
+            }
+        }
+        // If seq is out of range: data[3]=0, data[4..8]=0 — caller checks data[2] (next_seq).
+        syscall::send_msg(msg.sender as u64, &reply);
 
     } else if op == OP_SHUTDOWN {
         print("[init] shutdown requested by PID ");
@@ -213,6 +379,16 @@ pub extern "C" fn _start() -> ! {
     print("\n[init] PID 1 health monitor started (pid=");
     print_dec(my_pid as u64);
     print(")\n");
+
+    // Boot log — ring buffer exposed via OP_LOG_READ IPC to diagnostic clients.
+    let mut log = LogBuf::new();
+    {
+        let ts = syscall::clock();
+        let mut t = TextBuf::new();
+        t.push(b"init started pid=");
+        t.push_dec(my_pid as u64);
+        log.append(ts, t.as_bytes());
+    }
 
     // Critical services we watch.  Populated by name lookup after boot.
     let mut services: [ServiceEntry; 3] = [
@@ -243,13 +419,21 @@ pub extern "C" fn _start() -> ! {
                     print(" -> PID ");
                     print_dec(pid);
                     print("\n");
+
+                    let ts = syscall::clock();
+                    let mut t = TextBuf::new();
+                    t.push(b"resolved ");
+                    t.push(&svc.name[..svc.name.iter().position(|&c| c == 0).unwrap_or(svc.name.len())]);
+                    t.push(b" pid=");
+                    t.push_dec(pid);
+                    log.append(ts, t.as_bytes());
                 }
             }
         }
 
         // ── Drain any already-queued IPC messages (non-blocking) ─────────────
         while syscall::recv_msg(0, &mut msg) {
-            handle_msg(&mut msg, &mut services, &mut last_beat);
+            handle_msg(&mut msg, &mut services, &mut last_beat, &mut log);
         }
 
         // ── Block waiting for the next message (heartbeat watchdog timeout) ───
@@ -267,7 +451,7 @@ pub extern "C" fn _start() -> ! {
         // 50 ticks = 500 ms at 100 Hz — well inside the 5-second timeout.
         const HEARTBEAT_CHECK_TICKS: u64 = 50;
         if syscall::recv_msg(HEARTBEAT_CHECK_TICKS, &mut msg) {
-            handle_msg(&mut msg, &mut services, &mut last_beat);
+            handle_msg(&mut msg, &mut services, &mut last_beat, &mut log);
         }
 
         // ── Heartbeat watchdog ────────────────────────────────────────────────
@@ -287,6 +471,14 @@ pub extern "C" fn _start() -> ! {
                     print_dec(now.wrapping_sub(last_beat[i]) / 1_000_000_000);
                     print("s\n");
                     last_beat[i] = now; // reset to suppress repeat spam
+
+                    let ts = syscall::clock();
+                    let mut t = TextBuf::new();
+                    t.push(b"HB TIMEOUT pid=");
+                    t.push_dec(svc.pid);
+                    t.push(b" ");
+                    t.push(&svc.name[..svc.name.iter().position(|&c| c == 0).unwrap_or(svc.name.len())]);
+                    log.append(ts, t.as_bytes());
                 }
             }
         } else {

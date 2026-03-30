@@ -158,6 +158,29 @@ pub fn clock() -> u64 {
     ret
 }
 
+/// Send a full Message to `to_pid` (SYS_SEND_MSG = 7).
+///
+/// Used to reply to SYS_CALL (17) callers: the caller blocks until someone
+/// sends a message to its mailbox; `send_msg` delivers that reply.
+/// Returns `true` on success.
+#[inline]
+pub fn send_msg(to_pid: u64, msg: &Msg) -> bool {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax")      7u64,
+            in("rdi")      to_pid,
+            in("rsi")      msg as *const Msg as u64,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret == 0
+}
+
 /// Ask the kernel to restart a named server from its embedded ELF image.
 ///
 /// `name` must be a 16-byte null-padded ASCII service name slice, e.g.
