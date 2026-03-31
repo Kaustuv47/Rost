@@ -1092,7 +1092,8 @@ Implemented as a full zsh-compatible shell — the default interactive shell for
       write <path> <text...>  — write space-joined args (+ newline) to a mutable file
 
 [x] exec <path>   — read ELF from VFS, call SYS_SPAWN_ELF (26), print new PID
-                     — /bin/hello (hello-world demo binary) is embedded in the VFS
+                     — /bin/hello   (hello-world Rust demo) embedded in VFS
+                     — /bin/hello-c (freestanding C demo) embedded in VFS; no libc / no CRT
                      — 512 KB static EXEC_BUF in shell BSS; ELF magic validated before spawn
 [x] ps command    — SYS_LIST_PROCS (28) snapshots kernel process table; 24 B/entry
 ```
@@ -1138,7 +1139,8 @@ Virtual filesystem IPC server; runs as ring-3 ELF binary (PID 4 by convention).
       — PATH_BYTES=48 (data[2..8]); CHUNK_SIZE=40 (data[3..8]); NAME_BYTES=40
       — errno: ENOENT=1, ENOTDIR=2, EISDIR=3, ENOSYS=4, ENOSPC=5, EBADF=6, EMFILE=7, EACCES=8
 [x] Static RAM filesystem (fs.rs)
-      — /bin/hello (ELF stub, executable), /etc/{hosts,motd,passwd}
+      — /bin/hello (Rust ELF demo), /bin/hello-c (freestanding C ELF demo)
+      — /etc/{hosts,motd,passwd}
       — /home/user/{notes.txt, readme.txt}, /root/.profile
       — /var/log/ (empty directory), /motd.txt, /version.txt
       — lookup(path): splits on '/', trims nulls, walks DirEntry tree

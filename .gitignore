@@ -1,3 +1,4 @@
 /target
 /build
-/servers/target
+/servers/targetservers/hello-c/hello-c
+servers/hello-c/hello.o

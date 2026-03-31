@@ -9,7 +9,8 @@
 //! ```
 //! /
 //! ├── bin/
-//! │   └── hello              (ELF stub, executable)
+//! │   ├── hello              (Rust ELF demo — exec /bin/hello)
+//! │   └── hello-c            (C ELF demo   — exec /bin/hello-c)
 //! ├── etc/
 //! │   ├── hosts
 //! │   ├── motd
@@ -132,12 +133,13 @@ Remaining work\n\
 [x] SYS_LIST_PROCS (28): snapshot process table for ps command\n\
 [x] init server (PID 1): heartbeat watchdog + fault/restart handling\n\
 [x] hello-world demo ELF at /bin/hello (exec /bin/hello to test)\n\
+[x] hello-c demo ELF at /bin/hello-c (freestanding C, no libc)\n\
 [ ] block-drv server (virtio-blk or IDE port-I/O)\n\
 [ ] FAT32 parser on top of block-drv\n\
 [ ] True preemptive ISR scheduling (currently deferred at hlt boundaries)\n\
 [ ] SYS_MAP: map physical frames into an arbitrary process address space\n", 0);
 
-// hello-world demo ELF — compiled from servers/hello-world.
+// hello-world demo ELF — compiled from servers/hello-world (Rust).
 // Prints "[hello-world] Hello from ring-3!" to the serial console and exits.
 // Built by scripts/build.sh before the VFS crate is compiled.
 static F_HELLO: Node = Node::file(
@@ -148,11 +150,24 @@ static F_HELLO: Node = Node::file(
     0x02,
 );
 
+// hello-c demo ELF — compiled from servers/hello-c (freestanding C).
+// Demonstrates running C ring-3 code with no libc/CRT; uses inline asm
+// for SYS_UART_WRITE (12) and SYS_EXIT (1).
+// Built by scripts/build.sh (make -C servers/hello-c) before VFS compiles.
+static F_HELLO_C: Node = Node::file(
+    include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../hello-c/hello-c"
+    )),
+    0x02,
+);
+
 // ── Directory structure ───────────────────────────────────────────────────────
 // Leaf directories first so parent statics can reference them.
 
-static ENTRIES_BIN: [DirEntry; 1] = [
-    DirEntry { name: b"hello", node: &F_HELLO },
+static ENTRIES_BIN: [DirEntry; 2] = [
+    DirEntry { name: b"hello",   node: &F_HELLO   },
+    DirEntry { name: b"hello-c", node: &F_HELLO_C },
 ];
 static D_BIN: Node = Node::dir(&ENTRIES_BIN);
 

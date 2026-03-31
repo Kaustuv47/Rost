@@ -40,6 +40,13 @@ SERVERS_FLAGS="${REMAP} -C link-arg=-nostdlib -C no-redzone -C relocation-model=
 echo "[build] Compiling hello-world demo binary..."
 RUSTFLAGS="${SERVERS_FLAGS}" cargo build --manifest-path "$ROOT/servers/Cargo.toml" --target x86_64-unknown-none -p hello-world
 
+# Step 1b-c: Build hello-c (freestanding C demo) via its Makefile.
+# The VFS embeds this ELF via include_bytes!(servers/hello-c/hello-c), so it
+# must exist before the servers workspace is compiled.
+# Requires: clang (--target=x86_64-unknown-none-elf) + rust-lld (from rustup).
+echo "[build] Compiling hello-c demo binary (freestanding C)..."
+make -C "$ROOT/servers/hello-c" --no-print-directory
+
 # Step 1b: Build all remaining ring-3 server ELF binaries (x86_64-unknown-none).
 # The kernel embeds these at compile time via include_bytes!(), so they
 # must exist before the kernel is compiled.
