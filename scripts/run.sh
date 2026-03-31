@@ -14,7 +14,8 @@ QEMU_ARGS=(
   -drive   "format=raw,file=fat:rw:$ROOT/build/"
   -device  ib700,id=watchdog0
   -watchdog-action reset
-  -net     none
+  -netdev  "user,id=net0"
+  -device  "virtio-net-pci,netdev=net0"
   -nographic
 )
 

@@ -11,6 +11,10 @@ name = "rost-init"
 version = "0.1.0"
 
 [[package]]
+name = "rost-net"
+version = "0.1.0"
+
+[[package]]
 name = "rost-shell"
 version = "0.1.0"
 

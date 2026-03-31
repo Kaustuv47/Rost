@@ -1201,7 +1201,7 @@ All drivers run in ring 3.  A driver crash cannot take down the kernel.
       — maps framebuffer physical address via SYS_MAP
       — exposes blit / fill / draw-text IPC interface
 [ ] PS/2 keyboard driver  (or USB HID via xHCI — long term)
-[ ] virtio-net driver     (QEMU networking; long term)
+[x] virtio-net driver     (QEMU networking — rost-net server, PID 6)
 [ ] PCI bus enumeration   (scan, read config space, allocate BARs)
 ```
 
@@ -1222,16 +1222,22 @@ Visible output in the QEMU window (currently blank — serial only).
 
 ---
 
-### 20  Network Stack  (long term)
+### 20  Network Stack
 
 ```
-[ ] virtio-net driver    (see §18)
-[ ] Ethernet frame TX/RX
-[ ] ARP
-[ ] IPv4 / ICMPv4
-[ ] UDP
-[ ] TCP  (minimal — connection setup/teardown + stream)
-[ ] BSD-style socket API  (sys_socket, sys_bind, sys_connect, sys_send, sys_recv)
+[x] virtio-net driver    (legacy PCI, QUEUE_SIZE=256, BAR0 I/O port, 8 pre-filled RX bufs)
+[x] Ethernet frame TX/RX (eth.rs — Ethernet II parse/build, ETH_ARP/ETH_IPV4)
+[x] ARP                  (arp.rs — 8-entry cache, request/reply, resolve helper)
+[x] IPv4 / ICMPv4        (ipv4.rs — 20-byte header, auto-checksum; icmp.rs — echo req/reply)
+[x] UDP                  (udp.rs — 4-slot socket table, bind/deliver/get_pending)
+[x] TCP  (minimal)       (tcp.rs — single conn; states Closed/SynSent/Established/FinWait1/CloseWait; client-only)
+[x] IPC socket API       (socket.rs — OP_NET_PING/UDP_BIND/UDP_SEND/UDP_RECV/TCP_CONNECT/TCP_SEND/TCP_RECV/TCP_CLOSE/GET_IP)
+[x] Shell ping command   (shell: ping [ip] [count] → OP_NET_PING → ICMP echo → RTT display)
+[x] Kernel I/O port syscalls (SYS_IOPORT_OUT=29, SYS_IOPORT_IN=30 — ring-3 PCI/device access)
+[x] Kernel phys-addr syscall (SYS_PHYS_ADDR=31 — virt→phys translation for DMA setup)
+      — rost-net registered as "rost-net" in service registry; spawned as PID 6
+      — QEMU: -netdev user,id=net0 -device virtio-net-pci,netdev=net0
+      — Guest IP: 10.0.2.15; gateway 10.0.2.2 (default ping target)
 ```
 
 ---

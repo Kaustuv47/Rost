@@ -79,6 +79,7 @@ const COMMANDS: &[&[u8]] = &[
     b"mem",
     b"mkdir",
     b"mount",
+    b"ping",
     b"ps",
     b"pwd",
     b"rm",
@@ -399,6 +400,7 @@ fn dispatch(line: &[u8], ctx: &mut ExecCtx<'_>) -> (Action, u64) {
         b"mem"     => { cmd_mem(); 0 }
         b"mkdir"   => { cmd_mkdir(&args, ctx.cwd) }
         b"mount"   => { cmd_mount(); 0 }
+        b"ping"    => { cmd_ping(&args); 0 }
         b"ps"      => { cmd_ps(ctx.pid); 0 }
         b"pwd"     => { cmd_pwd(ctx.cwd); 0 }
         b"rm"      => { cmd_rm(&args, ctx.cwd) }
@@ -598,6 +600,7 @@ fn cmd_help() {
     serial::print_str("  mem                show memory info\n");
     serial::print_str("  mkdir <path>       create a directory\n");
     serial::print_str("  mount              show mount table\n");
+    serial::print_str("  ping [ip] [count]  ICMP echo (default: 10.0.2.2, 4 pings)\n");
     serial::print_str("  ps                 list processes\n");
     serial::print_str("  pwd                print working directory\n");
     serial::print_str("  rm <path>          remove a mutable file or directory\n");
@@ -868,6 +871,101 @@ fn cmd_log() {
     serial::print_str("Fields: magic, vector, tick, pid, rip, rflags, cr2.\n");
     serial::print_str("Access requires a privileged IPC call to the kernel\n");
     serial::print_str("(SYS_LOG not yet exposed to ring-3).\n");
+}
+
+// ── ping ──────────────────────────────────────────────────────────────────────
+
+fn cmd_ping(args: &Args<'_>) {
+    let ip_str = args.get(1);
+    let ip = if ip_str.is_empty() {
+        [10, 0, 2, 2]           // default: QEMU user-net gateway
+    } else {
+        match parse_ipv4_addr(ip_str) {
+            Some(a) => a,
+            None => {
+                serial::print_str("ping: invalid address\n");
+                return;
+            }
+        }
+    };
+
+    let net_pid = crate::syscall::lookup(b"rost-net\0");
+    if net_pid == u64::MAX {
+        serial::print_str("ping: rost-net not running\n");
+        return;
+    }
+
+    // Print "PING <ip>" header
+    serial::print_str("PING ");
+    print_ipv4(ip);
+    serial::print_str("\n");
+
+    let count: u64 = {
+        let c = args.get(2);
+        if c.is_empty() { 4 } else { parse_u64(c).max(1).min(16) }
+    };
+
+    let ip_u32 = u32::from_le_bytes(ip);
+    let mut req = crate::syscall::Msg::zeroed();
+    req.data[0] = 0x0100u64;       // OP_NET_PING
+    req.data[1] = ip_u32 as u64;
+    req.data[2] = 1;
+
+    for seq in 1..=count {
+        let mut reply = crate::syscall::Msg::zeroed();
+        // 300 ticks = 3 s timeout (100 Hz)
+        if crate::syscall::call(net_pid, &req, &mut reply, 300) && reply.data[0] == 0x0100 {
+            let rtt = reply.data[1];
+            if rtt == 0xFFFF {
+                serial::print_str("seq=");
+                print_u64(seq);
+                serial::print_str(" Request timeout\n");
+            } else {
+                serial::print_str("seq=");
+                print_u64(seq);
+                serial::print_str(" rtt=");
+                print_u64(rtt);
+                serial::print_str(" ms\n");
+            }
+        } else {
+            serial::print_str("seq=");
+            print_u64(seq);
+            serial::print_str(" no reply\n");
+        }
+    }
+}
+
+/// Parse a dotted-decimal IPv4 address (e.g. "10.0.2.15") into a [u8; 4].
+fn parse_ipv4_addr(s: &[u8]) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut octet_idx = 0usize;
+    let mut acc = 0u32;
+    let mut any_digit = false;
+    for &b in s {
+        if b == b'.' {
+            if octet_idx >= 3 || !any_digit { return None; }
+            octets[octet_idx] = acc as u8;
+            octet_idx += 1;
+            acc = 0;
+            any_digit = false;
+        } else if b >= b'0' && b <= b'9' {
+            acc = acc * 10 + (b - b'0') as u32;
+            if acc > 255 { return None; }
+            any_digit = true;
+        } else {
+            return None;
+        }
+    }
+    if octet_idx != 3 || !any_digit { return None; }
+    octets[3] = acc as u8;
+    Some(octets)
+}
+
+fn print_ipv4(ip: [u8; 4]) {
+    for i in 0..4 {
+        print_u64(ip[i] as u64);
+        if i < 3 { serial::put_byte(b'.'); }
+    }
 }
 
 fn cmd_ps(my_pid: u32) {

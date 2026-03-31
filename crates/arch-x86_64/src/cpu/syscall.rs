@@ -92,6 +92,9 @@ const SYS_INJECT_FAULT: u64 = 25; // trigger CPU exception for handler-path test
 const SYS_SPAWN_ELF:       u64 = 26; // load ring-3 ELF from user buffer + spawn process
 const SYS_RESTART_SERVER:  u64 = 27; // restart a named server via kernel-embedded ELF
 const SYS_LIST_PROCS:      u64 = 28; // list active processes → user buffer (a0=ptr, a1=cap)
+const SYS_IOPORT_OUT:      u64 = 29; // proxy port I/O write for ring-3 drivers (port, val, width)
+const SYS_IOPORT_IN:       u64 = 30; // proxy port I/O read  for ring-3 drivers (port, width)
+const SYS_PHYS_ADDR:       u64 = 31; // translate virtual → physical address (for DMA setup)
 
 // Error codes
 const ENOSYS:    u64 = u64::MAX;      // -1: function not implemented
@@ -1276,6 +1279,87 @@ extern "sysv64" fn dispatch_syscall(
                 }
             }
             count as u64
+        }
+
+        // SYS_IOPORT_OUT — write a value to an x86 I/O port on behalf of a ring-3 driver.
+        //
+        // Ring-3 processes run with IOPL=0, so IN/OUT instructions fault.
+        // This syscall lets privileged driver servers access hardware I/O ports
+        // through the kernel without requiring full IOPL privilege.
+        //
+        // a0 = port number (0 – 0xFFFF)
+        // a1 = value to write
+        // a2 = width in bytes: 1 = byte, 2 = word, 4 = dword (default dword for any other)
+        //
+        // Returns 0.  Returns EINVAL if port > 0xFFFF.
+        SYS_IOPORT_OUT => {
+            if a0 > 0xFFFF { return EINVAL; }
+            let port = a0 as u16;
+            unsafe {
+                match a2 {
+                    1 => core::arch::asm!("out dx, al",
+                            in("dx") port, in("al") a1 as u8,
+                            options(nostack, nomem)),
+                    2 => core::arch::asm!("out dx, ax",
+                            in("dx") port, in("ax") a1 as u16,
+                            options(nostack, nomem)),
+                    _ => core::arch::asm!("out dx, eax",
+                            in("dx") port, in("eax") a1 as u32,
+                            options(nostack, nomem)),
+                }
+            }
+            0
+        }
+
+        // SYS_IOPORT_IN — read a value from an x86 I/O port on behalf of a ring-3 driver.
+        //
+        // a0 = port number (0 – 0xFFFF)
+        // a1 = width in bytes: 1 = byte, 2 = word, 4 = dword (default dword)
+        //
+        // Returns the value read (zero-extended to u64).
+        // Returns EINVAL if port > 0xFFFF.
+        SYS_IOPORT_IN => {
+            if a0 > 0xFFFF { return EINVAL; }
+            let port = a0 as u16;
+            unsafe {
+                match a1 {
+                    1 => { let v: u8;  core::arch::asm!("in al, dx",
+                               out("al")  v, in("dx") port, options(nostack, nomem)); v as u64 }
+                    2 => { let v: u16; core::arch::asm!("in ax, dx",
+                               out("ax")  v, in("dx") port, options(nostack, nomem)); v as u64 }
+                    _ => { let v: u32; core::arch::asm!("in eax, dx",
+                               out("eax") v, in("dx") port, options(nostack, nomem)); v as u64 }
+                }
+            }
+        }
+
+        // SYS_PHYS_ADDR — resolve a virtual address in the calling process's address
+        // space to its physical address.
+        //
+        // Used by ring-3 DMA drivers (e.g., virtio-net) to convert static BSS buffer
+        // virtual addresses into physical addresses for programming hardware descriptor
+        // rings.  The kernel identity-maps all physical memory, so pml4_phys == pml4_virt.
+        //
+        // a0 = virtual address (need not be page-aligned; page offset is preserved)
+        //
+        // Returns the physical address (including the page offset) on success.
+        // Returns EINVAL if the virtual address is not mapped.
+        // Returns ENOSYS if no scheduler is active.
+        SYS_PHYS_ADDR => {
+            let sched = match core_kernel::scheduler::get_global() {
+                Some(s) => s,
+                None    => return ENOSYS,
+            };
+            let pid = core_kernel::process::ProcessId::new(
+                core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed));
+            let pml4_phys = sched.get_process_pml4(pid)
+                .unwrap_or_else(|| core_kernel::scheduler::KERNEL_PML4_PHYS
+                    .load(Ordering::Relaxed));
+            let pml4 = unsafe { &*(pml4_phys as *const core_kernel::memory::PageTable) };
+            match core_kernel::memory::translate_address(pml4, a0) {
+                Some(phys) => phys,
+                None       => EINVAL,
+            }
         }
 
         _ => ENOSYS,

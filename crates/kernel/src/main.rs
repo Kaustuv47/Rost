@@ -23,6 +23,7 @@ pub mod elf;
 //   PID 3 — rost-uart-drv  (UART driver; shell sends bytes here)
 //   PID 4 — rost-vfs       (virtual filesystem)
 //   PID 5 — rost-shell     (interactive shell)
+//   PID 6 — rost-net       (network stack: virtio-net + ARP/IPv4/ICMPv4/UDP/TCP)
 static INIT_ELF: &[u8] = include_bytes!(
     "../../../servers/target/x86_64-unknown-none/debug/rost-init"
 );
@@ -34,6 +35,9 @@ static VFS_ELF: &[u8] = include_bytes!(
 );
 static SHELL_ELF: &[u8] = include_bytes!(
     "../../../servers/target/x86_64-unknown-none/debug/rost-shell"
+);
+static NET_ELF: &[u8] = include_bytes!(
+    "../../../servers/target/x86_64-unknown-none/debug/rost-net"
 );
 
 use arch_x86_64::cpu::{GlobalDescriptorTable, InterruptDescriptorTable};
@@ -189,6 +193,8 @@ unsafe fn restart_server_hook(name_ptr: *const u8, name_len: usize) -> u32 {
         (VFS_ELF, 64)
     } else if name == b"rost-shell" {
         (SHELL_ELF, 64)
+    } else if name == b"rost-net" {
+        (NET_ELF, 48)
     } else {
         return u32::MAX; // unknown server name
     };
@@ -891,6 +897,12 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
     let shell_pid = elf::spawn_elf(SHELL_ELF, 64);
     if shell_pid.is_none() {
         hal::uart::print_str("      [WARN] shell ELF load failed\n");
+    }
+
+    hal::uart::print_str("      └─ Spawning rost-net...\n");
+    let net_pid = elf::spawn_elf(NET_ELF, 48); // priority 48: between init(32) and uart-drv(64)
+    if net_pid.is_none() {
+        hal::uart::print_str("      [WARN] rost-net ELF load failed\n");
     }
 
     // Set TSS.RSP0, CURRENT_PID, and the scheduler's internal current_process
