@@ -178,16 +178,45 @@ unsafe fn init_unit(base: u64) -> bool {
     write64(base, OFF_RTADDR, root_phys);
 
     // Issue SRTP (Set Root Table Pointer) and wait for hardware to acknowledge.
+    // IEC 61508 §7.4.1: all busy-waits must be bounded.  VT-d SRTP typically
+    // completes in < 1 µs; 100 000 iterations is a safe upper bound (~10 ms).
     write32(base, OFF_GCMD, GCMD_SRTP);
-    while read32(base, OFF_GSTS) & GSTS_RTPS == 0 { /* spin */ }
+    {
+        let mut t = 100_000u32;
+        while read32(base, OFF_GSTS) & GSTS_RTPS == 0 {
+            t -= 1;
+            if t == 0 {
+                hal::uart::print_str("  [iommu] WARN: SRTP timeout\n");
+                return false;
+            }
+        }
+    }
 
     // Flush write buffers before enabling translation.
     write32(base, OFF_GCMD, GCMD_WBF);
-    while read32(base, OFF_GSTS) & GSTS_WBFS != 0 { /* spin */ }
+    {
+        let mut t = 100_000u32;
+        while read32(base, OFF_GSTS) & GSTS_WBFS != 0 {
+            t -= 1;
+            if t == 0 {
+                hal::uart::print_str("  [iommu] WARN: WBF timeout\n");
+                return false;
+            }
+        }
+    }
 
     // Enable IOMMU translation (TE) and wait for GSTS.TES.
     write32(base, OFF_GCMD, GCMD_TE);
-    while read32(base, OFF_GSTS) & GSTS_TES == 0 { /* spin */ }
+    {
+        let mut t = 100_000u32;
+        while read32(base, OFF_GSTS) & GSTS_TES == 0 {
+            t -= 1;
+            if t == 0 {
+                hal::uart::print_str("  [iommu] WARN: TE timeout\n");
+                return false;
+            }
+        }
+    }
 
     hal::uart::print_str("  enabled\n");
     true

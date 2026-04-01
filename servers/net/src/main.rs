@@ -62,6 +62,28 @@ static mut PKTBUF: [u8; 1536] = [0u8; 1536];
 /// Scratch RX buffer used during blocking ARP/ICMP resolution loops.
 static mut RX_SCRATCH: [u8; 1520] = [0u8; 1520];
 
+// ── Async TCP-connect state machine ──────────────────────────────────────────
+//
+// State transitions:
+//   Idle → WaitARP   (on OP_NET_TCP_CONNECT, ARP miss)
+//   Idle → WaitSynAck(on OP_NET_TCP_CONNECT, ARP hit: SYN sent)
+//   WaitARP → WaitSynAck (on ARP reply: send SYN)
+//   WaitSynAck → Idle    (on TCP Established / Reset, or on deadline)
+//   WaitARP → Idle       (on deadline)
+
+const TCP_SM_IDLE:        u8 = 0;
+const TCP_SM_WAIT_ARP:    u8 = 1;
+const TCP_SM_WAIT_SYNACK: u8 = 2;
+
+static mut TCP_SM_STATE:    u8  = TCP_SM_IDLE;
+static mut TCP_SM_SENDER:   u32 = 0;
+static mut TCP_SM_DST_IP:   u32 = 0; // little-endian
+static mut TCP_SM_DST_PORT: u16 = 0;
+static mut TCP_SM_CONN_ID:  u8  = 0;
+static mut TCP_SM_DEADLINE: u64 = 0;
+/// Resolved destination MAC (filled when leaving WaitARP).
+static mut TCP_SM_DST_MAC: [u8; 6] = [0u8; 6];
+
 // ── Async ping state machine ──────────────────────────────────────────────────
 //
 // State transitions:
@@ -329,15 +351,22 @@ fn advance_ping_seq() -> (u16, u16) {
 
 /// Check whether the pending ping has exceeded its deadline.
 /// Called once per main-loop iteration.
-fn check_pending_deadlines(vnet: &mut VirtioNet) {
-    let state = unsafe { PENDING_STATE };
-    if state == PING_IDLE { return; }
+fn check_pending_deadlines(_vnet: &mut VirtioNet) {
+    let now = clock();
 
-    if clock() >= unsafe { PENDING_DEADLINE } {
+    // ── Ping deadline ─────────────────────────────────────────────────────────
+    if unsafe { PENDING_STATE } != PING_IDLE && now >= unsafe { PENDING_DEADLINE } {
         let sender = unsafe { PENDING_SENDER };
         unsafe { PENDING_STATE = PING_IDLE; }
         reply_data(sender, OP_NET_PING, 0xFFFF); // timeout
-        let _ = vnet; // suppress unused warning
+    }
+
+    // ── TCP connect deadline ──────────────────────────────────────────────────
+    if unsafe { TCP_SM_STATE } != TCP_SM_IDLE && now >= unsafe { TCP_SM_DEADLINE } {
+        let sender = unsafe { TCP_SM_SENDER };
+        unsafe { TCP_SM_STATE = TCP_SM_IDLE; }
+        tcp_close();
+        reply_data(sender, OP_NET_TCP_CONNECT, 0xFF); // timeout
     }
 }
 
@@ -375,40 +404,23 @@ fn build_and_send_icmp_request(
 
 // ── ARP resolution ────────────────────────────────────────────────────────────
 
-/// Resolve a target IP to its MAC address.
-/// First checks the ARP cache; if not found, sends an ARP request and polls
-/// RX for up to 2 seconds.
+/// Look up a target IP in the ARP cache.
+///
+/// If the cache misses, send an ARP request and return `None` — the ARP reply
+/// will arrive asynchronously via the IRQ-driven RX path and populate the
+/// cache.  The caller should reply `EAGAIN` (0xFFFD) so the client can retry
+/// after a short wait.
+///
+/// This is non-blocking: no polling loop, no 2-second stall.
 fn resolve_mac(target_ip: [u8; 4], vnet: &mut VirtioNet) -> Option<[u8; 6]> {
-    // Cache hit?
     if let Some(mac) = lookup_mac(target_ip) {
         return Some(mac);
     }
-
-    // Send ARP request
+    // Cache miss — kick an ARP request; reply arrives via IRQ → poll_rx
     let pktbuf = unsafe { &mut *addr_of_mut!(PKTBUF) };
     let len = build_arp_request(vnet.mac, OUR_IP, target_ip, pktbuf);
-    if len == 0 { return None; }
-    vnet.send_packet(&pktbuf[..len]);
-
-    // Poll for ARP reply up to 2 seconds
-    let deadline = clock() + 2_000_000_000;
-    loop {
-        if clock() >= deadline { return None; }
-
-        let scratch = unsafe { &mut *addr_of_mut!(RX_SCRATCH) };
-        if let Some(n) = vnet.recv_packet_into(scratch) {
-            let frame = &scratch[..n];
-            if let Some(eth) = parse_eth(frame) {
-                if eth.ethertype == ETH_ARP {
-                    handle_arp_packet(eth.payload, eth.src, vnet);
-                }
-            }
-        }
-
-        if let Some(mac) = lookup_mac(target_ip) {
-            return Some(mac);
-        }
-    }
+    if len > 0 { vnet.send_packet(&pktbuf[..len]); }
+    None
 }
 
 // ── UDP send ──────────────────────────────────────────────────────────────────
@@ -428,10 +440,14 @@ fn handle_udp_send(msg: &Msg, vnet: &mut VirtioNet) {
     unpack_words_to_bytes(&msg.data[3..8], &mut payload_buf);
     let payload = &payload_buf[..payload_len];
 
-    // Resolve destination MAC
+    // Resolve destination MAC (non-blocking; EAGAIN if ARP cache miss)
     let dst_mac = match resolve_mac(dst_ip, vnet) {
         Some(m) => m,
-        None => { reply_err(sender, OP_NET_UDP_SEND); return; }
+        None => {
+            // ARP request kicked; client should retry after ~20 ms
+            reply_data(sender, OP_NET_UDP_SEND, 0xFFFD); // EAGAIN
+            return;
+        }
     };
 
     // Build UDP
@@ -453,16 +469,24 @@ fn handle_udp_send(msg: &Msg, vnet: &mut VirtioNet) {
     }
 }
 
-// ── TCP connect ───────────────────────────────────────────────────────────────
+// ── TCP connect (non-blocking, interrupt-driven) ──────────────────────────────
+//
+// OP_NET_TCP_CONNECT starts the TCP-connect state machine and returns
+// immediately.  The reply is delivered asynchronously when the SYN-ACK
+// arrives via the IRQ-driven RX path (handle_tcp_incoming → tcp_sm_on_established).
 
 fn handle_tcp_connect(msg: &Msg, vnet: &mut VirtioNet) {
-    let sender   = msg.sender;
+    let sender     = msg.sender;
     let dst_ip_u32 = msg.data[1] as u32;
-    let dst_ip   = dst_ip_u32.to_le_bytes();
-    let dst_port = msg.data[2] as u16;
-
-    // Use fixed ephemeral port for simplicity (single connection)
+    let dst_ip     = dst_ip_u32.to_le_bytes();
+    let dst_port   = msg.data[2] as u16;
     let local_port = EPHEMERAL_PORT_BASE;
+
+    // Reject if another connect is already in flight
+    if unsafe { TCP_SM_STATE } != TCP_SM_IDLE {
+        reply_data(sender, OP_NET_TCP_CONNECT, 0xFF);
+        return;
+    }
 
     let conn_id = tcp_connect(dst_ip, dst_port, local_port, sender);
     if conn_id == 0xFF {
@@ -470,17 +494,40 @@ fn handle_tcp_connect(msg: &Msg, vnet: &mut VirtioNet) {
         return;
     }
 
-    // Resolve destination MAC
-    let dst_mac = match resolve_mac(dst_ip, vnet) {
-        Some(m) => m,
-        None => {
+    let deadline = clock() + 5_000_000_000; // 5-second timeout
+
+    // Fast path: MAC already in ARP cache → send SYN immediately
+    if let Some(dst_mac) = resolve_mac(dst_ip, vnet) {
+        if tcp_sm_send_syn(dst_ip, dst_mac, vnet) {
+            unsafe {
+                TCP_SM_STATE    = TCP_SM_WAIT_SYNACK;
+                TCP_SM_SENDER   = sender;
+                TCP_SM_DST_IP   = dst_ip_u32;
+                TCP_SM_DST_PORT = dst_port;
+                TCP_SM_CONN_ID  = conn_id;
+                TCP_SM_DEADLINE = deadline;
+                TCP_SM_DST_MAC  = dst_mac;
+            }
+        } else {
             tcp_close();
             reply_data(sender, OP_NET_TCP_CONNECT, 0xFF);
-            return;
         }
-    };
+        return;
+    }
 
-    // Send SYN
+    // Slow path: ARP miss → wait for ARP reply, then send SYN
+    unsafe {
+        TCP_SM_STATE    = TCP_SM_WAIT_ARP;
+        TCP_SM_SENDER   = sender;
+        TCP_SM_DST_IP   = dst_ip_u32;
+        TCP_SM_DST_PORT = dst_port;
+        TCP_SM_CONN_ID  = conn_id;
+        TCP_SM_DEADLINE = deadline;
+    }
+}
+
+/// Send a TCP SYN to dst_ip/dst_mac.  Returns true on success.
+fn tcp_sm_send_syn(dst_ip: [u8; 4], dst_mac: [u8; 6], vnet: &mut VirtioNet) -> bool {
     let conn = get_conn();
     let mut tcp_buf = [0u8; 64];
     let tcp_len = build_tcp(
@@ -494,71 +541,56 @@ fn handle_tcp_connect(msg: &Msg, vnet: &mut VirtioNet) {
         &mut tcp_buf,
     );
     fill_tcp_checksum(OUR_IP, dst_ip, &mut tcp_buf[..tcp_len]);
-    conn.seq = conn.seq.wrapping_add(1); // SYN consumes one seq number
+    conn.seq = conn.seq.wrapping_add(1);
 
     let mut ip_buf = [0u8; 128];
     let ip_len = build_ipv4(IP_PROTO_TCP, OUR_IP, dst_ip, &tcp_buf[..tcp_len], &mut ip_buf);
     let pktbuf = unsafe { &mut *addr_of_mut!(PKTBUF) };
     let eth_len = build_eth(dst_mac, vnet.mac, ETH_IPV4, &ip_buf[..ip_len], pktbuf);
+    eth_len > 0 && vnet.send_packet(&pktbuf[..eth_len])
+}
 
-    if eth_len == 0 || !vnet.send_packet(&pktbuf[..eth_len]) {
+/// Called by handle_arp_packet when the TCP-connect SM is in WaitARP and
+/// the ARP reply resolves our pending destination.
+fn tcp_sm_on_arp_resolved(dst_ip: [u8; 4], dst_mac: [u8; 6], vnet: &mut VirtioNet) {
+    if tcp_sm_send_syn(dst_ip, dst_mac, vnet) {
+        unsafe {
+            TCP_SM_STATE   = TCP_SM_WAIT_SYNACK;
+            TCP_SM_DST_MAC = dst_mac;
+        }
+    } else {
+        let sender = unsafe { TCP_SM_SENDER };
+        unsafe { TCP_SM_STATE = TCP_SM_IDLE; }
         tcp_close();
         reply_data(sender, OP_NET_TCP_CONNECT, 0xFF);
-        return;
     }
+}
 
-    // Poll for SYN-ACK (up to 5 seconds)
-    let deadline = clock() + 5_000_000_000;
-    loop {
-        if clock() >= deadline {
-            tcp_close();
-            reply_data(sender, OP_NET_TCP_CONNECT, 0xFF);
-            return;
-        }
+/// Called by handle_tcp_incoming when a TCP event occurs while the SM is
+/// in WaitSynAck.
+fn tcp_sm_on_established(vnet: &mut VirtioNet) {
+    let sender   = unsafe { TCP_SM_SENDER };
+    let conn_id  = unsafe { TCP_SM_CONN_ID };
+    let dst_ip   = unsafe { TCP_SM_DST_IP  }.to_le_bytes();
+    let dst_mac  = unsafe { TCP_SM_DST_MAC };
+    unsafe { TCP_SM_STATE = TCP_SM_IDLE; }
 
-        let scratch = unsafe { &mut *addr_of_mut!(RX_SCRATCH) };
-        if let Some(n) = vnet.recv_packet_into(scratch) {
-            let frame = &scratch[..n];
-            if let Some(eth) = parse_eth(frame) {
-                if eth.ethertype == ETH_IPV4 {
-                    if let Some((iph, ip_payload)) = parse_ipv4(eth.payload) {
-                        if iph.proto == IP_PROTO_TCP {
-                            if let Some(event) = handle_tcp(iph.src, ip_payload, OUR_IP) {
-                                match event {
-                                    TcpEvent::Established => {
-                                        // Send ACK
-                                        let c = get_conn();
-                                        send_tcp_packet(
-                                            dst_ip,
-                                            dst_mac,
-                                            c.local_port,
-                                            c.remote_port,
-                                            c.seq,
-                                            c.ack,
-                                            TCP_ACK,
-                                            65535,
-                                            &[],
-                                            vnet,
-                                        );
-                                        reply_data(sender, OP_NET_TCP_CONNECT, conn_id as u64);
-                                        return;
-                                    }
-                                    TcpEvent::Reset => {
-                                        tcp_close();
-                                        reply_data(sender, OP_NET_TCP_CONNECT, 0xFF);
-                                        return;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                } else if eth.ethertype == ETH_ARP {
-                    handle_arp_packet(eth.payload, eth.src, vnet);
-                }
-            }
-        }
-    }
+    let c = get_conn();
+    send_tcp_packet(
+        dst_ip, dst_mac,
+        c.local_port, c.remote_port,
+        c.seq, c.ack,
+        TCP_ACK, 65535, &[],
+        vnet,
+    );
+    reply_data(sender, OP_NET_TCP_CONNECT, conn_id as u64);
+}
+
+fn tcp_sm_on_reset() {
+    let sender = unsafe { TCP_SM_SENDER };
+    unsafe { TCP_SM_STATE = TCP_SM_IDLE; }
+    tcp_close();
+    reply_data(sender, OP_NET_TCP_CONNECT, 0xFF);
 }
 
 // ── TCP send ──────────────────────────────────────────────────────────────────
@@ -680,27 +712,35 @@ fn handle_arp_packet(payload: &[u8], _eth_src: [u8; 6], vnet: &mut VirtioNet) {
     }
 
     // ── Async ping state machine: ARP reply may resolve our pending target ────
-    if unsafe { PENDING_STATE } != PING_WAIT_ARP { return; }
+    if unsafe { PENDING_STATE } == PING_WAIT_ARP {
+        let pending_ip_raw = unsafe { PENDING_TARGET_IP };
+        let pending_ip     = pending_ip_raw.to_le_bytes();
 
-    let pending_ip_raw = unsafe { PENDING_TARGET_IP };
-    let pending_ip     = pending_ip_raw.to_le_bytes();
-
-    if let Some(dst_mac) = lookup_mac(pending_ip) {
-        // ARP resolved — advance to WaitICMP
-        let (id, seq) = advance_ping_seq();
-        let sent_ns   = clock();
-        if build_and_send_icmp_request(pending_ip, dst_mac, vnet, id, seq) {
-            unsafe {
-                PENDING_STATE    = PING_WAIT_ICMP;
-                PENDING_ICMP_ID  = id;
-                PENDING_ICMP_SEQ = seq;
-                PENDING_SENT_NS  = sent_ns;
+        if let Some(dst_mac) = lookup_mac(pending_ip) {
+            let (id, seq) = advance_ping_seq();
+            let sent_ns   = clock();
+            if build_and_send_icmp_request(pending_ip, dst_mac, vnet, id, seq) {
+                unsafe {
+                    PENDING_STATE    = PING_WAIT_ICMP;
+                    PENDING_ICMP_ID  = id;
+                    PENDING_ICMP_SEQ = seq;
+                    PENDING_SENT_NS  = sent_ns;
+                }
+            } else {
+                let sender = unsafe { PENDING_SENDER };
+                unsafe { PENDING_STATE = PING_IDLE; }
+                reply_data(sender, OP_NET_PING, 0xFFFF);
             }
-        } else {
-            // Could not send — fail the ping
-            let sender = unsafe { PENDING_SENDER };
-            unsafe { PENDING_STATE = PING_IDLE; }
-            reply_data(sender, OP_NET_PING, 0xFFFF);
+        }
+    }
+
+    // ── TCP-connect state machine: ARP reply may resolve pending destination ─
+    if unsafe { TCP_SM_STATE } == TCP_SM_WAIT_ARP {
+        let tcp_ip_raw = unsafe { TCP_SM_DST_IP };
+        let tcp_ip     = tcp_ip_raw.to_le_bytes();
+
+        if let Some(dst_mac) = lookup_mac(tcp_ip) {
+            tcp_sm_on_arp_resolved(tcp_ip, dst_mac, vnet);
         }
     }
 }
@@ -791,24 +831,21 @@ fn handle_tcp_incoming(src_ip: [u8; 4], payload: &[u8], vnet: &mut VirtioNet) {
     if let Some(event) = handle_tcp(src_ip, payload, OUR_IP) {
         match event {
             TcpEvent::Established => {
-                // Outgoing connect was in progress — send ACK
+                // If the TCP-connect state machine is waiting for SYN-ACK,
+                // let it handle the ACK and reply to the caller.
+                if unsafe { TCP_SM_STATE } == TCP_SM_WAIT_SYNACK {
+                    tcp_sm_on_established(vnet);
+                    return;
+                }
+                // Fallback: no pending connect SM — send ACK anyway (shouldn't happen)
                 let conn = get_conn();
                 let dst_ip  = conn.remote_ip;
                 let dst_mac = lookup_mac(dst_ip).unwrap_or([0xFF; 6]);
-                let local_port  = conn.local_port;
-                let remote_port = conn.remote_port;
-                let seq = conn.seq;
-                let ack = conn.ack;
                 send_tcp_packet(
-                    dst_ip,
-                    dst_mac,
-                    local_port,
-                    remote_port,
-                    seq,
-                    ack,
-                    TCP_ACK,
-                    65535,
-                    &[],
+                    dst_ip, dst_mac,
+                    conn.local_port, conn.remote_port,
+                    conn.seq, conn.ack,
+                    TCP_ACK, 65535, &[],
                     vnet,
                 );
             }
@@ -817,24 +854,22 @@ fn handle_tcp_incoming(src_ip: [u8; 4], payload: &[u8], vnet: &mut VirtioNet) {
                 let conn = get_conn();
                 let dst_ip  = conn.remote_ip;
                 let dst_mac = lookup_mac(dst_ip).unwrap_or([0xFF; 6]);
-                let local_port  = conn.local_port;
-                let remote_port = conn.remote_port;
-                let seq = conn.seq;
-                let ack = conn.ack;
                 send_tcp_packet(
-                    dst_ip,
-                    dst_mac,
-                    local_port,
-                    remote_port,
-                    seq,
-                    ack,
-                    TCP_ACK,
-                    65535,
-                    &[],
+                    dst_ip, dst_mac,
+                    conn.local_port, conn.remote_port,
+                    conn.seq, conn.ack,
+                    TCP_ACK, 65535, &[],
                     vnet,
                 );
             }
-            TcpEvent::Closed | TcpEvent::Reset => {
+            TcpEvent::Reset => {
+                if unsafe { TCP_SM_STATE } == TCP_SM_WAIT_SYNACK {
+                    tcp_sm_on_reset();
+                } else {
+                    tcp_close();
+                }
+            }
+            TcpEvent::Closed => {
                 tcp_close();
             }
         }

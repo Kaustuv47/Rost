@@ -1256,20 +1256,22 @@ delivery where possible.
 
 #### Polling patterns — disposition
 
-| Pattern                   | Location       | Disposition                                                                          |
-|---------------------------|----------------|--------------------------------------------------------------------------------------|
-| UART TX THRE spin         | hal/uart.rs    | Bounded (≤1 M iters, FIFO). Acceptable — no IRQ path for TX FIFO-ready on 8250.    |
-| PIT calibration spin      | lapic.rs       | Boot-time only. N/A.                                                                 |
-| Virtio TX used-ring poll  | virtio.rs      | Reduced 500 K→50 K (≤5 ms cap). Further reduction requires MSI-X (future).          |
-| Virtio RX polling         | net/main.rs    | **Converted** — IRQ-driven (see §20 IRQ-driven RX).                                 |
-| Ping blocking loop        | net/main.rs    | **Converted** — async state machine (see §20 Async ping).                           |
-| ARP blocking loop         | net/main.rs    | **Converted** — async state machine integrated with ARP handler.                     |
-| IOMMU GSTS spin           | iommu.rs       | Hardware handshake — no IRQ available. N/A.                                          |
-| Shell input               | shell/io.rs    | Already interrupt-driven via uart-drv ISR (vector 36).                               |
-| Net IPC recv timeout      | net/main.rs    | **Converted** — recv_msg(10)→recv_msg(100); IRQ wakes earlier.                      |
-| Init lazy PID lookup      | init/main.rs   | Low priority (boot-time retry). Acceptable.                                          |
+| Pattern                   | Location       | Disposition                                                                                     |
+|---------------------------|----------------|-------------------------------------------------------------------------------------------------|
+| UART TX THRE spin         | hal/uart.rs    | Bounded (≤1 M iters, FIFO). Acceptable — no IRQ path for TX FIFO-ready on 8250.               |
+| PIT calibration spin      | lapic.rs       | Boot-time only. N/A.                                                                            |
+| Virtio TX used-ring poll  | virtio.rs      | Reduced 500 K→50 K (≤5 ms cap). Further reduction requires MSI-X (future).                     |
+| Virtio RX polling         | net/main.rs    | **Converted** — IRQ-driven (see §20 IRQ-driven RX).                                            |
+| Ping blocking loop        | net/main.rs    | **Converted** — async ping state machine (§20).                                                 |
+| ARP blocking loop (ping)  | net/main.rs    | **Converted** — async ping SM handles ARP miss (§20).                                          |
+| resolve_mac() blocking    | net/main.rs    | **Converted** — cache-only + async ARP kick; UDP/TCP callers get EAGAIN on cache miss.          |
+| TCP connect blocking loop | net/main.rs    | **Converted** — async TCP-connect SM (WaitARP→WaitSynAck→Idle; see §21 below).                 |
+| IOMMU GSTS spins (×3)     | iommu.rs       | **Bounded** — added 100 000-iteration safety timeout per IEC 61508 §7.4.1; log+fail on breach. |
+| Shell input               | shell/io.rs    | Already interrupt-driven via uart-drv ISR (vector 36).                                          |
+| Net IPC recv timeout      | net/main.rs    | **Converted** — recv_msg(10)→recv_msg(100); IRQ wakes earlier.                                 |
+| Init lazy PID lookup      | init/main.rs   | Low priority (boot-time retry). Acceptable.                                                     |
 
-#### Infrastructure added (this milestone)
+#### Infrastructure added (pass 1 — §20 milestone)
 
 ```
 [x] irq_registry module     (core-kernel/src/irq_registry.rs)
@@ -1288,6 +1290,27 @@ delivery where possible.
       — Validated: GSI must be 8-15; IOAPIC base must be non-zero
 [x] Kernel main.rs Stage 3  (crates/kernel/src/main.rs)
       — Calls set_ioapic_base(ioapic_base) after ioapic::init() to publish base for SYS_IRQ_REGISTER
+```
+
+#### Infrastructure added (pass 2 — this milestone)
+
+```
+[x] IOMMU GSTS safety timeouts   (core-kernel/src/iommu/mod.rs)
+      — SRTP / WBF / TE handshakes: unbounded spins → 100 000-iter countdown + warn+fail on breach
+      — Satisfies IEC 61508 §7.4.1 liveness requirement for all kernel busy-waits
+[x] resolve_mac() non-blocking   (servers/net/src/main.rs)
+      — Removed 2-second blocking ARP poll loop
+      — Cache hit → return MAC immediately; cache miss → send ARP request, return None (EAGAIN)
+      — ARP reply populates cache asynchronously via IRQ → poll_rx → handle_arp_packet
+[x] UDP send EAGAIN              (servers/net/src/main.rs)
+      — OP_NET_UDP_SEND on ARP cache miss → reply 0xFFFD (EAGAIN); client retries after ~20 ms
+[x] TCP-connect async SM         (servers/net/src/main.rs)
+      — TCP_SM_STATE: Idle / WaitARP / WaitSynAck
+      — WaitARP: sends ARP request; advances to WaitSynAck when ARP reply resolves destination
+      — WaitSynAck: tcp_sm_on_established() sends ACK and delivers conn_id to caller
+      — tcp_sm_on_reset(): cleans up and delivers 0xFF to caller
+      — 5-second deadline checked each main-loop iteration via check_pending_deadlines()
+      — Both ARP and SYN-ACK phases now driven by hardware IRQ → poll_rx → handle_packet
 ```
 
 ---
