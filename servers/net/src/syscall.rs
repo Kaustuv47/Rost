@@ -17,6 +17,7 @@
 //! | 29 | ioport_out    |
 //! | 30 | ioport_in     |
 //! | 31 | phys_addr     |
+//! | 32 | irq_register  |
 
 // ── Message struct (must match core_kernel::ipc::Message layout) ─────────────
 //
@@ -253,6 +254,31 @@ pub fn ioport_in(port: u16, width: u8) -> u32 {
         );
     }
     ret as u32
+}
+
+/// Register this process as the interrupt handler for PCI GSI `gsi` (8–15).
+///
+/// The kernel will route the IOAPIC GSI → IDT vector (32+GSI) and, on each
+/// interrupt, read `isr_port` (to de-assert the virtio line) then deliver an
+/// IPC message with `data[0] = 0xFFFF_0000 | gsi`.
+///
+/// Returns `true` on success.
+#[inline]
+pub fn irq_register(gsi: u8, isr_port: u16) -> bool {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax")      32u64,
+            in("rdi")      gsi      as u64,
+            in("rsi")      isr_port as u64,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret == 0
 }
 
 /// Translate a virtual address to its physical address.

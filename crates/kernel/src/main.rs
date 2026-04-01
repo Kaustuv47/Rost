@@ -740,6 +740,8 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
             );
         }
         arch_x86_64::apic::ioapic::init(ioapic_base);
+        // Publish the IOAPIC base so SYS_IRQ_REGISTER can route PCI IRQs at runtime.
+        arch_x86_64::interrupts::set_ioapic_base(ioapic_base);
 
         // Route COM1 UART (ISA IRQ 4) to IDT vector 36 on BSP (LAPIC ID 0).
         // ISA IRQ 4 sits on IOAPIC pin (4 - gsi_base); gsi_base is 0 on q35.

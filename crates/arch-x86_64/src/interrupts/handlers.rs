@@ -462,21 +462,138 @@ unexpected_stub!(unexpected_vec28, 28);
 unexpected_stub!(unexpected_vec29, 29);
 unexpected_stub!(unexpected_vec30, 30);
 unexpected_stub!(unexpected_vec31, 31);
-// vectors 33–47 (IRQ1–IRQ15, slave PIC)
+// vectors 33–39 (IRQ1–IRQ7, master PIC range — still unexpected)
 unexpected_stub!(unexpected_vec33, 33);
 unexpected_stub!(unexpected_vec34, 34);
 unexpected_stub!(unexpected_vec35, 35);
 unexpected_stub!(unexpected_vec37, 37);
 unexpected_stub!(unexpected_vec38, 38);
 unexpected_stub!(unexpected_vec39, 39);
-unexpected_stub!(unexpected_vec40, 40);
-unexpected_stub!(unexpected_vec41, 41);
-unexpected_stub!(unexpected_vec42, 42);
-unexpected_stub!(unexpected_vec43, 43);
-unexpected_stub!(unexpected_vec44, 44);
-unexpected_stub!(unexpected_vec45, 45);
-unexpected_stub!(unexpected_vec46, 46);
-unexpected_stub!(unexpected_vec47, 47);
+// vectors 40–47 (IRQ8–IRQ15 / GSI 8–15) are replaced by pci_irq_gsi* below.
+
+// ── PCI IRQ handlers (GSI 8–15, vectors 40–47) ───────────────────────────────
+//
+// These replace the catch-all `unexpected_stub!` handlers for the slave-PIC
+// IRQ range.  When a ring-3 server calls `SYS_IRQ_REGISTER(gsi)`, the kernel
+// routes that GSI via the IOAPIC to the corresponding vector (32+gsi) and
+// stores the server PID in `core_kernel::irq_registry`.
+//
+// On each interrupt:
+//   1. Save caller-saved registers.
+//   2. Call `handle_pci_irq(gsi)`:
+//        - Read the device ISR port (BAR0+0x13 for virtio) to de-assert the
+//          interrupt line before EOI, preventing an immediate re-fire.
+//        - Send an IPC message `{data[0]=0xFFFF_0000|gsi}` to the registered
+//          server so it wakes from `recv_msg()` and drains the RX queue.
+//   3. EOI: slave PIC (0xA0) + master PIC (0x20) + LAPIC.
+//      Sending both PIC EOIs unconditionally is safe even when the IOAPIC
+//      delivers the interrupt (the PIC ISR bits remain clear).
+//   4. Reschedule (same call as UART RX ISR) — switches immediately to the
+//      server if it became the highest-priority runnable process.
+//   5. Restore registers and IRET.
+
+/// Read an I/O port byte inline (no syscall, safe to call from an ISR).
+#[inline(always)]
+unsafe fn inb_port(port: u16) -> u8 {
+    let val: u8;
+    core::arch::asm!(
+        "in al, dx",
+        out("al") val,
+        in("dx") port,
+        options(nostack, nomem),
+    );
+    val
+}
+
+/// Inner handler: clears the device interrupt and notifies the registered server.
+///
+/// Called with `gsi` in **rcx** (Windows x64 ABI — first integer argument).
+extern "C" fn handle_pci_irq(gsi: u8) {
+    if let Some((pid, isr_port)) = core_kernel::irq_registry::lookup(gsi) {
+        // Read ISR port to de-assert the device interrupt line (read-to-clear).
+        // Without this, the IOAPIC would re-fire the interrupt immediately
+        // after EOI (virtio-legacy keeps the interrupt pin asserted until the
+        // ISR register is read).
+        if isr_port != 0 {
+            unsafe { inb_port(isr_port); }
+        }
+
+        // Deliver an IPC notification to the registered ring-3 server.
+        // data[0] = 0xFFFF_0000 | gsi  → server detects by checking >> 16 == 0xFFFF.
+        if let Some(sched) = core_kernel::scheduler::get_global() {
+            let from = core_kernel::process::ProcessId::new(0); // kernel pseudo-PID
+            let to   = core_kernel::process::ProcessId::new(pid);
+            let mut msg = core_kernel::ipc::Message::new(from);
+            msg.set_data(0, 0xFFFF_0000_u64 | gsi as u64);
+            sched.send_message(from, to, msg);
+        }
+    }
+}
+
+/// Generate a naked ISR stub for PCI IRQ `gsi` (maps to IDT vector 32+gsi).
+///
+/// Stack alignment analysis:
+///   CPU pushes 24 bytes (rip/cs/rflags) for same-privilege ring-0 entry.
+///   9 caller-saved registers × 8 bytes = 72 bytes.
+///   Total below original RSP: 96 bytes (96 % 16 = 0).
+///   The `sub rsp, 8` before each `call` gives a 16-byte aligned stack. ✓
+macro_rules! pci_irq_stub {
+    ($name:ident, $gsi:expr) => {
+        #[unsafe(naked)]
+        pub unsafe extern "C" fn $name() {
+            core::arch::naked_asm!(
+                // 1. Save all caller-saved registers.
+                "push rax", "push rcx", "push rdx",
+                "push rdi", "push rsi",
+                "push r8",  "push r9", "push r10", "push r11",
+
+                // 2. Call handle_pci_irq(gsi).  Windows x64 ABI: arg1 in rcx.
+                concat!("mov rcx, ", $gsi),
+                "sub  rsp, 8",
+                "call {deliver}",
+                "add  rsp, 8",
+
+                // 3a. EOI to slave PIC (IRQs 8-15 are routed through the slave).
+                "mov  al, 0x20",
+                "out  0xA0, al",
+
+                // 3b. EOI to master PIC (cascade line IRQ2).
+                "out  0x20, al",
+
+                // 3c. EOI to LAPIC (if the LAPIC has been initialised).
+                "mov  rax, qword ptr [{eoi_addr}]",
+                "test rax, rax",
+                "jz   2f",
+                "mov  dword ptr [rax], 0",
+                "2:",
+
+                // 4. Reschedule if the notified server has higher priority.
+                "sub  rsp, 8",
+                "call {sched}",
+                "add  rsp, 8",
+
+                // 5. Restore registers and return from interrupt.
+                "pop  r11", "pop  r10", "pop  r9", "pop  r8",
+                "pop  rsi", "pop  rdi",
+                "pop  rdx", "pop  rcx", "pop  rax",
+                "iretq",
+
+                deliver  = sym handle_pci_irq,
+                eoi_addr = sym LAPIC_EOI_ADDR,
+                sched    = sym crate::cpu::uart_rx_isr,
+            );
+        }
+    };
+}
+
+pci_irq_stub!(pci_irq_gsi8,  8);
+pci_irq_stub!(pci_irq_gsi9,  9);
+pci_irq_stub!(pci_irq_gsi10, 10);
+pci_irq_stub!(pci_irq_gsi11, 11);
+pci_irq_stub!(pci_irq_gsi12, 12);
+pci_irq_stub!(pci_irq_gsi13, 13);
+pci_irq_stub!(pci_irq_gsi14, 14);
+pci_irq_stub!(pci_irq_gsi15, 15);
 // vectors 48–254
 unexpected_stub!(unexpected_vec48,  48);  unexpected_stub!(unexpected_vec49,  49);
 unexpected_stub!(unexpected_vec50,  50);  unexpected_stub!(unexpected_vec51,  51);

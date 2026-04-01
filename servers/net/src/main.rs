@@ -30,17 +30,17 @@ use core::ptr::addr_of_mut;
 use arp::{build_arp_reply, build_arp_request, handle_arp, lookup_mac};
 use eth::{build_eth, parse_eth, ETH_ARP, ETH_IPV4};
 use icmp::{
-    build_icmp_echo_reply, build_icmp_echo_request, parse_icmp_echo_reply,
+    build_icmp_echo_reply, build_icmp_echo_request,
     ICMP_ECHO_REQUEST,
 };
 use ipv4::{build_ipv4, parse_ipv4, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP};
 use socket::*;
-use syscall::{clock, exit, getpid, print, recv_msg, register, uart_write, yield_, Msg};
+use syscall::{clock, exit, getpid, irq_register, print, recv_msg, register, yield_, Msg};
 use tcp::{
     build_tcp, fill_tcp_checksum, get_conn, handle_tcp, tcp_close, tcp_connect, TcpEvent,
     TcpState, TCP_ACK, TCP_FIN, TCP_SYN,
 };
-use udp::{build_udp, deliver, get_pending, parse_udp};
+use udp::{build_udp, deliver, parse_udp};
 use virtio::VirtioNet;
 
 // ── Network configuration ─────────────────────────────────────────────────────
@@ -62,16 +62,32 @@ static mut PKTBUF: [u8; 1536] = [0u8; 1536];
 /// Scratch RX buffer used during blocking ARP/ICMP resolution loops.
 static mut RX_SCRATCH: [u8; 1520] = [0u8; 1520];
 
-// ── Pending ping state ────────────────────────────────────────────────────────
+// ── Async ping state machine ──────────────────────────────────────────────────
+//
+// State transitions:
+//   Idle → WaitARP  (on OP_NET_PING, ARP miss)
+//   Idle → WaitICMP (on OP_NET_PING, ARP hit)
+//   WaitARP  → WaitICMP  (on ARP reply that resolves pending target)
+//   WaitICMP → Idle      (on ICMP echo reply matching id+seq, or on deadline)
+//   WaitARP  → Idle      (on deadline)
 
-/// When an ICMP echo reply arrives, main loop stores the arrival tick here.
-static mut PING_ARRIVED_NS: u64 = 0;
-/// Set to true when a ping reply has been received and not yet consumed.
-static mut PING_REPLY_READY: bool = false;
-/// ICMP sequence number currently waiting for a reply.
-static mut PING_SEQ: u16 = 0;
-/// ICMP identifier used for this session.
-static mut PING_ID: u16 = 0xBEEF;
+const PING_IDLE:     u8 = 0;
+const PING_WAIT_ARP: u8 = 1;
+const PING_WAIT_ICMP:u8 = 2;
+
+static mut PENDING_STATE:     u8       = PING_IDLE;
+/// PID that issued the pending OP_NET_PING.
+static mut PENDING_SENDER:    u32      = 0;
+/// Target IP packed as little-endian u32.
+static mut PENDING_TARGET_IP: u32      = 0;
+/// Absolute ns deadline for the pending operation.
+static mut PENDING_DEADLINE:  u64      = 0;
+/// ICMP echo identifier for the pending ping.
+static mut PENDING_ICMP_ID:   u16      = 0xBEEF;
+/// ICMP echo sequence for the pending ping.
+static mut PENDING_ICMP_SEQ:  u16      = 0;
+/// Clock value when the ICMP echo request was sent (for RTT calculation).
+static mut PENDING_SENT_NS:   u64      = 0;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -89,25 +105,55 @@ pub extern "C" fn _start() -> ! {
         print(b"[net] ERROR: virtio-net device not found\n");
     }
 
+    // Register for hardware interrupts from the virtio-net NIC.
+    // The kernel will route the IOAPIC GSI to IDT vector (32+GSI) and,
+    // on each interrupt, deliver an IPC message with data[0] = 0xFFFF_0000|gsi.
+    if let Some(ref vnet) = vnet_opt {
+        let (irq, isr_port) = vnet.irq_info();
+        if irq >= 8 && irq <= 15 {
+            if irq_register(irq, isr_port) {
+                print(b"[net] IRQ registered (interrupt-driven RX)\n");
+            } else {
+                print(b"[net] IRQ register failed (polling fallback)\n");
+            }
+        } else {
+            print(b"[net] IRQ out of range (polling fallback)\n");
+        }
+    }
+
     print(b"[net] entering main loop\n");
 
     let mut msg = Msg::zeroed();
 
     loop {
-        // Block for up to 100ms (10 ticks at 100 Hz) waiting for an IPC message
-        if recv_msg(10, &mut msg) {
-            if let Some(ref mut vnet) = vnet_opt {
+        // Block for up to 1 s (100 ticks at 100 Hz) waiting for an IPC message
+        // or a hardware-IRQ notification from the kernel.
+        let got_msg = recv_msg(100, &mut msg);
+
+        if got_msg {
+            // Check for kernel-delivered hardware IRQ notification:
+            //   data[0] = 0xFFFF_0000 | gsi
+            if (msg.data[0] >> 16) == 0xFFFF {
+                // IRQ fired — drain the RX ring immediately
+                if let Some(ref mut vnet) = vnet_opt {
+                    poll_rx(vnet);
+                }
+            } else if let Some(ref mut vnet) = vnet_opt {
                 handle_ipc(&msg, vnet);
             } else {
-                // No NIC — reply with error to all requests
                 let op = msg.data[0];
                 reply_err(msg.sender, op);
             }
+        } else {
+            // Timeout — fallback poll in case an IRQ was missed
+            if let Some(ref mut vnet) = vnet_opt {
+                poll_rx(vnet);
+            }
         }
 
-        // Poll RX queue
+        // Advance the async ping state machine (check deadlines, send replies).
         if let Some(ref mut vnet) = vnet_opt {
-            poll_rx(vnet);
+            check_pending_deadlines(vnet);
         }
 
         yield_();
@@ -216,79 +262,82 @@ fn handle_ipc(msg: &Msg, vnet: &mut VirtioNet) {
     }
 }
 
-// ── Ping implementation ───────────────────────────────────────────────────────
+// ── Ping implementation (non-blocking, interrupt-driven) ─────────────────────
+//
+// OP_NET_PING no longer spins — it starts the state machine and returns.
+// The reply is delivered asynchronously when the ARP reply and ICMP echo
+// reply arrive (driven by hardware IRQ → poll_rx → handle_packet).
 
 fn handle_ping(msg: &Msg, vnet: &mut VirtioNet) {
     let sender    = msg.sender;
     let ip_raw    = msg.data[1] as u32;
     let target_ip = ip_raw.to_le_bytes();
-    let _count    = if msg.data[2] == 0 { 1 } else { msg.data[2] };
 
-    // Resolve target MAC via ARP
-    let dst_mac = match resolve_mac(target_ip, vnet) {
-        Some(m) => m,
-        None => {
-            reply_data(sender, OP_NET_PING, 0xFFFF);
-            return;
-        }
-    };
-
-    // Build and send ICMP echo request
-    let seq = unsafe {
-        PING_SEQ = PING_SEQ.wrapping_add(1);
-        PING_SEQ
-    };
-    let id = unsafe { PING_ID };
-
-    let sent_ns = clock();
-
-    let sent = build_and_send_icmp_request(target_ip, dst_mac, vnet, id, seq);
-    if !sent {
-        reply_data(sender, OP_NET_PING, 0xFFFF);
+    // Reject if another ping is already in flight
+    if unsafe { PENDING_STATE } != PING_IDLE {
+        reply_data(sender, OP_NET_PING, 0xFFFE); // busy
         return;
     }
 
-    // Poll for ICMP echo reply up to 2 seconds
-    let deadline = sent_ns + 2_000_000_000;
-    loop {
-        if clock() >= deadline {
+    let deadline = clock() + 2_000_000_000; // 2-second timeout
+
+    // Fast path: ARP cache hit → skip ARP phase, go straight to WaitICMP
+    if let Some(dst_mac) = lookup_mac(target_ip) {
+        let (id, seq) = advance_ping_seq();
+        let sent_ns   = clock();
+        if !build_and_send_icmp_request(target_ip, dst_mac, vnet, id, seq) {
             reply_data(sender, OP_NET_PING, 0xFFFF);
             return;
         }
-
-        // Check if an async PING_REPLY_READY was set by handle_packet
-        let ready = unsafe { PING_REPLY_READY };
-        if ready {
-            let arrived_ns = unsafe { PING_ARRIVED_NS };
-            unsafe { PING_REPLY_READY = false; }
-            let rtt_ms = (arrived_ns.saturating_sub(sent_ns)) / 1_000_000;
-            reply_data(sender, OP_NET_PING, rtt_ms);
-            return;
+        unsafe {
+            PENDING_STATE     = PING_WAIT_ICMP;
+            PENDING_SENDER    = sender;
+            PENDING_TARGET_IP = ip_raw;
+            PENDING_DEADLINE  = deadline;
+            PENDING_ICMP_ID   = id;
+            PENDING_ICMP_SEQ  = seq;
+            PENDING_SENT_NS   = sent_ns;
         }
+        return;
+    }
 
-        // Poll RX
-        let scratch = unsafe { &mut *addr_of_mut!(RX_SCRATCH) };
-        if let Some(n) = vnet.recv_packet_into(scratch) {
-            let frame = &scratch[..n];
-            // Check if this is our ICMP reply inline
-            if let Some(eth) = parse_eth(frame) {
-                if eth.ethertype == ETH_IPV4 {
-                    if let Some((iph, ip_payload)) = parse_ipv4(eth.payload) {
-                        if iph.proto == IP_PROTO_ICMP {
-                            if parse_icmp_echo_reply(ip_payload, id, seq) {
-                                let rtt_ms = (clock().saturating_sub(sent_ns)) / 1_000_000;
-                                reply_data(sender, OP_NET_PING, rtt_ms);
-                                return;
-                            }
-                        }
-                        // Dispatch non-ping packets to normal handler
-                        handle_ipv4_packet(iph, ip_payload, eth.src, vnet);
-                    }
-                } else if eth.ethertype == ETH_ARP {
-                    handle_arp_packet(eth.payload, eth.src, vnet);
-                }
-            }
-        }
+    // Slow path: ARP miss → send ARP request, wait for reply
+    let pktbuf = unsafe { &mut *addr_of_mut!(PKTBUF) };
+    let len = build_arp_request(vnet.mac, OUR_IP, target_ip, pktbuf);
+    if len == 0 {
+        reply_data(sender, OP_NET_PING, 0xFFFF);
+        return;
+    }
+    vnet.send_packet(&pktbuf[..len]);
+
+    unsafe {
+        PENDING_STATE     = PING_WAIT_ARP;
+        PENDING_SENDER    = sender;
+        PENDING_TARGET_IP = ip_raw;
+        PENDING_DEADLINE  = deadline;
+    }
+}
+
+/// Advance and return the next (id, seq) for an outgoing ICMP echo request.
+#[inline]
+fn advance_ping_seq() -> (u16, u16) {
+    unsafe {
+        PENDING_ICMP_SEQ = PENDING_ICMP_SEQ.wrapping_add(1);
+        (PENDING_ICMP_ID, PENDING_ICMP_SEQ)
+    }
+}
+
+/// Check whether the pending ping has exceeded its deadline.
+/// Called once per main-loop iteration.
+fn check_pending_deadlines(vnet: &mut VirtioNet) {
+    let state = unsafe { PENDING_STATE };
+    if state == PING_IDLE { return; }
+
+    if clock() >= unsafe { PENDING_DEADLINE } {
+        let sender = unsafe { PENDING_SENDER };
+        unsafe { PENDING_STATE = PING_IDLE; }
+        reply_data(sender, OP_NET_PING, 0xFFFF); // timeout
+        let _ = vnet; // suppress unused warning
     }
 }
 
@@ -629,6 +678,31 @@ fn handle_arp_packet(payload: &[u8], _eth_src: [u8; 6], vnet: &mut VirtioNet) {
             }
         }
     }
+
+    // ── Async ping state machine: ARP reply may resolve our pending target ────
+    if unsafe { PENDING_STATE } != PING_WAIT_ARP { return; }
+
+    let pending_ip_raw = unsafe { PENDING_TARGET_IP };
+    let pending_ip     = pending_ip_raw.to_le_bytes();
+
+    if let Some(dst_mac) = lookup_mac(pending_ip) {
+        // ARP resolved — advance to WaitICMP
+        let (id, seq) = advance_ping_seq();
+        let sent_ns   = clock();
+        if build_and_send_icmp_request(pending_ip, dst_mac, vnet, id, seq) {
+            unsafe {
+                PENDING_STATE    = PING_WAIT_ICMP;
+                PENDING_ICMP_ID  = id;
+                PENDING_ICMP_SEQ = seq;
+                PENDING_SENT_NS  = sent_ns;
+            }
+        } else {
+            // Could not send — fail the ping
+            let sender = unsafe { PENDING_SENDER };
+            unsafe { PENDING_STATE = PING_IDLE; }
+            reply_data(sender, OP_NET_PING, 0xFFFF);
+        }
+    }
 }
 
 fn handle_ipv4_packet(
@@ -688,16 +762,18 @@ fn handle_icmp_packet(src_ip: [u8; 4], payload: &[u8], vnet: &mut VirtioNet) {
         }
 
         icmp::ICMP_ECHO_REPLY => {
-            // Check if this matches our pending ping
+            // Check if this matches our pending ping (async state machine)
+            if unsafe { PENDING_STATE } != PING_WAIT_ICMP { return; }
             let id  = if payload.len() >= 6 { u16::from_be_bytes([payload[4], payload[5]]) } else { 0 };
             let seq = if payload.len() >= 8 { u16::from_be_bytes([payload[6], payload[7]]) } else { 0 };
-            let our_id  = unsafe { PING_ID  };
-            let our_seq = unsafe { PING_SEQ };
+            let our_id  = unsafe { PENDING_ICMP_ID  };
+            let our_seq = unsafe { PENDING_ICMP_SEQ };
             if id == our_id && seq == our_seq {
-                unsafe {
-                    PING_ARRIVED_NS  = clock();
-                    PING_REPLY_READY = true;
-                }
+                let sent_ns = unsafe { PENDING_SENT_NS };
+                let sender  = unsafe { PENDING_SENDER  };
+                let rtt_ms  = (clock().saturating_sub(sent_ns)) / 1_000_000;
+                unsafe { PENDING_STATE = PING_IDLE; }
+                reply_data(sender, OP_NET_PING, rtt_ms);
             }
         }
 

@@ -95,6 +95,7 @@ const SYS_LIST_PROCS:      u64 = 28; // list active processes → user buffer (a
 const SYS_IOPORT_OUT:      u64 = 29; // proxy port I/O write for ring-3 drivers (port, val, width)
 const SYS_IOPORT_IN:       u64 = 30; // proxy port I/O read  for ring-3 drivers (port, width)
 const SYS_PHYS_ADDR:       u64 = 31; // translate virtual → physical address (for DMA setup)
+const SYS_IRQ_REGISTER:    u64 = 32; // register PCI IRQ handler: a0=GSI, a1=ISR port
 
 // Error codes
 const ENOSYS:    u64 = u64::MAX;      // -1: function not implemented
@@ -1360,6 +1361,39 @@ extern "sysv64" fn dispatch_syscall(
                 Some(phys) => phys,
                 None       => EINVAL,
             }
+        }
+
+        // SYS_IRQ_REGISTER — register the calling process as the interrupt handler
+        // for a PCI hardware IRQ (GSI 8–15).
+        //
+        // The kernel will:
+        //  1. Store caller PID → GSI mapping in irq_registry.
+        //  2. (Optionally) read ISR port before EOI to de-assert the device line.
+        //  3. Route the GSI via IOAPIC to IDT vector (32 + GSI).
+        //  4. On each IRQ, send an IPC message to the registered PID:
+        //       msg.data[0] = 0xFFFF_0000 | gsi
+        //
+        // a0 = GSI number (8–15 only; ISA IRQs 0–7 are reserved)
+        // a1 = ISR status port (I/O port to `inb` in the ISR to de-assert the line;
+        //      pass 0 if the device does not require an ISR-port read, e.g. MSI-X)
+        //
+        // Returns 0 on success, EINVAL if GSI is out of range or IOAPIC unavailable.
+        SYS_IRQ_REGISTER => {
+            let gsi = a0 as u8;
+            if gsi < 8 || gsi > 15 { return EINVAL; }
+            let caller_pid = core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed);
+            let isr_port   = a1 as u16;
+            if !core_kernel::irq_registry::register(gsi, caller_pid, isr_port) {
+                return EINVAL;
+            }
+            let ioapic_base = crate::interrupts::IOAPIC_BASE.load(Ordering::Relaxed);
+            if ioapic_base != 0 {
+                // Route GSI → IDT vector (32 + GSI), LAPIC ID 0.
+                unsafe {
+                    crate::apic::ioapic::route_irq(ioapic_base, gsi, (32 + gsi) as u8, 0);
+                }
+            }
+            0
         }
 
         _ => ENOSYS,

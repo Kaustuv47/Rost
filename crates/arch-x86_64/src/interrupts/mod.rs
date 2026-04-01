@@ -16,6 +16,20 @@ pub static TICK_COUNT: core::sync::atomic::AtomicU64 =
 pub static LAPIC_EOI_ADDR: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Physical base address of the I/O APIC MMIO block.
+///
+/// Written by `kernel/src/main.rs` after `apic::ioapic::init()`.  Used by the
+/// `SYS_IRQ_REGISTER` syscall handler to dynamically route PCI IRQs to IDT
+/// vectors without needing a callback into the kernel crate.
+/// 0 means the I/O APIC was not found (PIC-only mode).
+pub static IOAPIC_BASE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Store the I/O APIC MMIO base for use by the `SYS_IRQ_REGISTER` syscall.
+pub fn set_ioapic_base(base: u64) {
+    IOAPIC_BASE.store(base, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub use handlers::MAX_ISR_LATENCY;
 
 /// Wire all 256 IDT vectors.
@@ -53,11 +67,17 @@ pub fn init(idt: &mut InterruptDescriptorTable) {
     fill!( 33, unexpected_vec33);  fill!( 34, unexpected_vec34);
     fill!( 35, unexpected_vec35);
     fill!( 37, unexpected_vec37);  fill!( 38, unexpected_vec38);
-    fill!( 39, unexpected_vec39);  fill!( 40, unexpected_vec40);
-    fill!( 41, unexpected_vec41);  fill!( 42, unexpected_vec42);
-    fill!( 43, unexpected_vec43);  fill!( 44, unexpected_vec44);
-    fill!( 45, unexpected_vec45);  fill!( 46, unexpected_vec46);
-    fill!( 47, unexpected_vec47);
+    fill!( 39, unexpected_vec39);
+    // Vectors 40–47 = GSI 8–15: PCI IRQ handlers (replaces unexpected stubs).
+    // SYS_IRQ_REGISTER routes a specific GSI to its vector via IOAPIC.
+    idt.set_entry(40, IdtEntry::interrupt_gate(pci_irq_gsi8  as *const () as u64, 0x08));
+    idt.set_entry(41, IdtEntry::interrupt_gate(pci_irq_gsi9  as *const () as u64, 0x08));
+    idt.set_entry(42, IdtEntry::interrupt_gate(pci_irq_gsi10 as *const () as u64, 0x08));
+    idt.set_entry(43, IdtEntry::interrupt_gate(pci_irq_gsi11 as *const () as u64, 0x08));
+    idt.set_entry(44, IdtEntry::interrupt_gate(pci_irq_gsi12 as *const () as u64, 0x08));
+    idt.set_entry(45, IdtEntry::interrupt_gate(pci_irq_gsi13 as *const () as u64, 0x08));
+    idt.set_entry(46, IdtEntry::interrupt_gate(pci_irq_gsi14 as *const () as u64, 0x08));
+    idt.set_entry(47, IdtEntry::interrupt_gate(pci_irq_gsi15 as *const () as u64, 0x08));
     fill!( 48, unexpected_vec48);  fill!( 49, unexpected_vec49);
     fill!( 50, unexpected_vec50);  fill!( 51, unexpected_vec51);
     fill!( 52, unexpected_vec52);  fill!( 53, unexpected_vec53);

@@ -1235,6 +1235,13 @@ Visible output in the QEMU window (currently blank — serial only).
 [x] Shell ping command   (shell: ping [ip] [count] → OP_NET_PING → ICMP echo → RTT display)
 [x] Kernel I/O port syscalls (SYS_IOPORT_OUT=29, SYS_IOPORT_IN=30 — ring-3 PCI/device access)
 [x] Kernel phys-addr syscall (SYS_PHYS_ADDR=31 — virt→phys translation for DMA setup)
+[x] IRQ-driven RX        (SYS_IRQ_REGISTER=32: rost-net registers virtio-net GSI via IOAPIC;
+                           kernel ISR reads virtio ISR status port, delivers IPC 0xFFFF_0000|gsi;
+                           main loop dispatches IRQ notifications → poll_rx immediately)
+[x] Async ping           (non-blocking OP_NET_PING: state machine WaitARP→WaitICMP→Idle;
+                           reply sent asynchronously when ARP/ICMP packets arrive via IRQ;
+                           2-second deadline checked each main-loop iteration)
+[x] TX spin reduction    (virtio TX used-ring poll: 500 000 → 50 000 iterations ~5 ms cap)
       — rost-net registered as "rost-net" in service registry; spawned as PID 6
       — QEMU: -netdev user,id=net0 -device virtio-net-pci,netdev=net0
       — Guest IP: 10.0.2.15; gateway 10.0.2.2 (default ping target)
@@ -1242,7 +1249,50 @@ Visible output in the QEMU window (currently blank — serial only).
 
 ---
 
-### 21  POSIX Compatibility Layer  (long term)
+### 21  Interrupt-Driven I/O Conversion
+
+Audit of all polling patterns in the codebase and conversion to hardware-interrupt
+delivery where possible.
+
+#### Polling patterns — disposition
+
+| Pattern                   | Location       | Disposition                                                                          |
+|---------------------------|----------------|--------------------------------------------------------------------------------------|
+| UART TX THRE spin         | hal/uart.rs    | Bounded (≤1 M iters, FIFO). Acceptable — no IRQ path for TX FIFO-ready on 8250.    |
+| PIT calibration spin      | lapic.rs       | Boot-time only. N/A.                                                                 |
+| Virtio TX used-ring poll  | virtio.rs      | Reduced 500 K→50 K (≤5 ms cap). Further reduction requires MSI-X (future).          |
+| Virtio RX polling         | net/main.rs    | **Converted** — IRQ-driven (see §20 IRQ-driven RX).                                 |
+| Ping blocking loop        | net/main.rs    | **Converted** — async state machine (see §20 Async ping).                           |
+| ARP blocking loop         | net/main.rs    | **Converted** — async state machine integrated with ARP handler.                     |
+| IOMMU GSTS spin           | iommu.rs       | Hardware handshake — no IRQ available. N/A.                                          |
+| Shell input               | shell/io.rs    | Already interrupt-driven via uart-drv ISR (vector 36).                               |
+| Net IPC recv timeout      | net/main.rs    | **Converted** — recv_msg(10)→recv_msg(100); IRQ wakes earlier.                      |
+| Init lazy PID lookup      | init/main.rs   | Low priority (boot-time retry). Acceptable.                                          |
+
+#### Infrastructure added (this milestone)
+
+```
+[x] irq_registry module     (core-kernel/src/irq_registry.rs)
+      — Maps GSI 0-15 → (owner PID, ISR port) using lock-free AtomicU32/AtomicU16 arrays
+      — register(gsi, pid, isr_port) + lookup(gsi) — used by kernel ISR and SYS_IRQ_REGISTER
+[x] PCI IRQ IDT stubs       (arch-x86_64/src/interrupts/handlers.rs)
+      — pci_irq_stub! macro generates naked ISR for each of GSI 8-15 (vectors 40-47)
+      — ISR: save caller-saved regs → read device ISR port → IPC notify owner → slave+master+LAPIC EOI → reschedule
+      — handle_pci_irq(gsi): looks up irq_registry, inb(isr_port), send_message(owner, 0xFFFF_0000|gsi)
+[x] IOAPIC IDT wiring       (arch-x86_64/src/interrupts/mod.rs)
+      — Vectors 40-47 wired to pci_irq_gsi8..pci_irq_gsi15 (replaces unexpected_stub stubs)
+      — IOAPIC_BASE static published by set_ioapic_base() (called from kernel/main.rs Stage 3)
+[x] SYS_IRQ_REGISTER = 32  (arch-x86_64/src/cpu/syscall.rs)
+      — Ring-3 driver calls: a0=GSI (8-15), a1=ISR port
+      — Kernel: registers caller PID in irq_registry; routes IOAPIC GSI→vector (32+GSI)
+      — Validated: GSI must be 8-15; IOAPIC base must be non-zero
+[x] Kernel main.rs Stage 3  (crates/kernel/src/main.rs)
+      — Calls set_ioapic_base(ioapic_base) after ioapic::init() to publish base for SYS_IRQ_REGISTER
+```
+
+---
+
+### 22  POSIX Compatibility Layer  (long term)
 
 Thin library that maps POSIX calls onto Rost syscalls.
 Runs entirely in user space; nothing in ring 0.

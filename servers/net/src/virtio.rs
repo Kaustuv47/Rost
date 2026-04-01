@@ -9,7 +9,7 @@
 
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
-use crate::pci::{find_pci_device, get_io_bar, pci_read_command, pci_write_command};
+use crate::pci::{find_pci_device, get_io_bar, pci_read8, pci_read_command, pci_write_command};
 use crate::syscall::{ioport_in, ioport_out, phys_addr, print};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -125,6 +125,10 @@ struct VirtqUsedHdr {
 pub struct VirtioNet {
     pub io_base:      u16,
     pub mac:          [u8; 6],
+    /// PCI bus/device/function — stored so `irq_info()` can read PCI config 0x3C.
+    pci_bus:          u8,
+    pci_dev:          u8,
+    pci_func:         u8,
     /// Next descriptor index to use for TX (wraps QUEUE_SIZE)
     tx_desc_idx:      u16,
     /// Next avail ring slot to use for TX
@@ -287,6 +291,9 @@ pub fn init() -> Option<VirtioNet> {
     Some(VirtioNet {
         io_base,
         mac,
+        pci_bus:      bus,
+        pci_dev:      dev,
+        pci_func:     func,
         tx_desc_idx:  0,
         tx_avail_idx: 0,
         tx_used_last: 0,
@@ -372,7 +379,7 @@ impl VirtioNet {
                     break;
                 }
                 spins += 1;
-                if spins > 500_000 {
+                if spins > 50_000 {
                     // Timed out — still mark as done to avoid deadlock
                     self.tx_used_last = deadline_used;
                     return false;
@@ -428,6 +435,17 @@ impl VirtioNet {
 
             Some(copy_len)
         }
+    }
+
+    /// Return `(irq_line, isr_port)` for use with `SYS_IRQ_REGISTER`.
+    ///
+    /// `irq_line` is the PCI Interrupt Line from config offset 0x3C (GSI number).
+    /// `isr_port` is `io_base + VIRTIO_REG_ISR` (0x13): reading this byte de-asserts
+    /// the virtio interrupt line and must be done in the kernel ISR before EOI.
+    pub fn irq_info(&self) -> (u8, u16) {
+        let irq_line = pci_read8(self.pci_bus, self.pci_dev, self.pci_func, 0x3C);
+        let isr_port = self.io_base + VIRTIO_REG_ISR;
+        (irq_line, isr_port)
     }
 
     /// Re-enqueue an RX descriptor into the available ring after it has been consumed.
