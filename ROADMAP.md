@@ -1258,9 +1258,10 @@ delivery where possible.
 
 | Pattern                   | Location       | Disposition                                                                                     |
 |---------------------------|----------------|-------------------------------------------------------------------------------------------------|
-| UART TX THRE spin         | hal/uart.rs    | Bounded (≤1 M iters, FIFO). Acceptable — no IRQ path for TX FIFO-ready on 8250.               |
-| PIT calibration spin      | lapic.rs       | Boot-time only. N/A.                                                                            |
-| Virtio TX used-ring poll  | virtio.rs      | Reduced 500 K→50 K (≤5 ms cap). Further reduction requires MSI-X (future).                     |
+| UART TX THRE spin         | hal/uart.rs    | **Converted** — interrupt-driven TX ring buffer (see §21 pass 3).                              |
+| PIT calibration spin      | lapic.rs       | Cannot be interrupt-driven: PIT ch2 has no IRQ line (bit 5 of port 0x61 is a GPIO output).     |
+|                           |                | Runs once at boot; no scheduling impact. Genuinely not convertible without HPET interrupt SM.  |
+| Virtio TX used-ring poll  | virtio.rs      | **Converted** — non-blocking send; IRQ-driven reclaim via `reclaim_tx()` (see §21 pass 3).     |
 | Virtio RX polling         | net/main.rs    | **Converted** — IRQ-driven (see §20 IRQ-driven RX).                                            |
 | Ping blocking loop        | net/main.rs    | **Converted** — async ping state machine (§20).                                                 |
 | ARP blocking loop (ping)  | net/main.rs    | **Converted** — async ping SM handles ARP miss (§20).                                          |
@@ -1292,7 +1293,7 @@ delivery where possible.
       — Calls set_ioapic_base(ioapic_base) after ioapic::init() to publish base for SYS_IRQ_REGISTER
 ```
 
-#### Infrastructure added (pass 2 — this milestone)
+#### Infrastructure added (pass 3 — this milestone)
 
 ```
 [x] IOMMU GSTS safety timeouts   (core-kernel/src/iommu/mod.rs)
@@ -1312,6 +1313,38 @@ delivery where possible.
       — 5-second deadline checked each main-loop iteration via check_pending_deadlines()
       — Both ARP and SYN-ACK phases now driven by hardware IRQ → poll_rx → handle_packet
 ```
+
+#### Infrastructure added (pass 3 — UART TX + Virtio TX)
+
+```
+[x] UART TX interrupt-driven    (crates/hal/src/uart.rs)
+      — TX ring buffer: 255-byte SPSC (AtomicU8 head/tail, u8 wraps at 256)
+      — put_byte(): push to ring; if THRE set write one byte directly (pump-prime);
+        arm ETBEI (IER bit 1) so tx_isr drains the rest; zero busy-wait
+      — tx_isr(): pop next byte from ring, write to COM1 THR; disable ETBEI when empty
+      — Safe from ISR context: THRE interrupt armed but fires after iretq
+      — init(): ETBEI disabled initially; armed on-demand by put_byte
+[x] UART ISR IIR dispatch       (crates/arch-x86_64/src/interrupts/handlers.rs)
+      — handle_uart_rx() now reads IIR to determine interrupt cause:
+          IIR_THRE (0x02) → call hal::uart::tx_isr()
+          IIR_RDA  (0x04) / IIR_CTI (0x0C) → existing RX drain + IPC delivery
+          bit 0 set → spurious, return
+      — Single ISR handles both RX and TX for vector 36 (IRQ4, COM1)
+[x] Virtio TX non-blocking      (servers/net/src/virtio.rs)
+      — send_packet(): calls reclaim_tx() then checks ring space, kicks queue,
+        returns immediately — no spin loop
+      — reclaim_tx(): reads TX used-ring idx, advances tx_used_last; called from
+        IRQ notification path (reclaims TX completions alongside RX drain)
+      — Ring-space guard: returns false if >128 descriptors in-flight (never
+        happens in practice with single-threaded net server)
+```
+
+#### Remaining irreducible busy-waits (hardware limitations)
+
+| Pattern               | Reason not convertible                                               |
+|-----------------------|----------------------------------------------------------------------|
+| PIT ch2 calibration   | Port 0x61 bit 5 is a GPIO pin with no IRQ line; boot-time only once |
+| IOMMU SRTP/WBF/TE     | VT-d hardware protocol; completion signalled by GSTS poll only      |
 
 ---
 

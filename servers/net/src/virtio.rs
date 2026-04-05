@@ -305,11 +305,38 @@ pub fn init() -> Option<VirtioNet> {
 // ── Send a packet ─────────────────────────────────────────────────────────────
 
 impl VirtioNet {
+    /// Reclaim completed TX descriptors by advancing `tx_used_last` to match
+    /// the device's used-ring index.
+    ///
+    /// Called from the IRQ notification path in the main loop alongside
+    /// `poll_rx()`.  Also called at the start of `send_packet()` as a best-
+    /// effort reclaim before checking ring space.
+    pub fn reclaim_tx(&mut self) {
+        unsafe {
+            let tx_mem = addr_of_mut!(TX_QUEUE_MEM) as *mut u8;
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            let used_idx = read_volatile(&(*used_hdr_ptr(tx_mem)).idx);
+            self.tx_used_last = used_idx;
+        }
+    }
+
     /// Send `data` as an Ethernet frame.
     /// Prepends a zero virtio net header and uses two chained descriptors.
+    /// Returns immediately after kicking the TX queue (non-blocking).
     pub fn send_packet(&mut self, data: &[u8]) -> bool {
         if data.len() > PKT_BUF_SIZE - VIRTIO_NET_HDR_SIZE {
             return false;
+        }
+
+        // Reclaim completed descriptors before checking ring space.
+        self.reclaim_tx();
+
+        // Each TX uses 2 descriptors.  tx_avail_idx tracks how many we've
+        // submitted; tx_used_last tracks how many the device has consumed.
+        // Refuse to send if we'd overflow the 256-slot descriptor ring.
+        let in_flight = self.tx_avail_idx.wrapping_sub(self.tx_used_last) as usize;
+        if in_flight >= QUEUE_SIZE / 2 {
+            return false; // TX ring full — caller should retry
         }
 
         unsafe {
@@ -364,28 +391,10 @@ impl VirtioNet {
             // Kick TX queue
             io_write16(self.io_base, VIRTIO_REG_QUEUE_NOTIFY, QUEUE_TX);
 
-            // Advance our desc index by 2
+            // Advance descriptor index by 2 (header + payload descriptors).
             self.tx_desc_idx = self.tx_desc_idx.wrapping_add(2) % QUEUE_SIZE as u16;
-
-            // Poll TX used ring until the device has consumed this buffer.
-            // Spin for up to ~50k iterations (~5ms at typical speeds).
-            let deadline_used = self.tx_used_last.wrapping_add(1);
-            let mut spins = 0u32;
-            loop {
-                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                let used_idx = read_volatile(&(*used_hdr_ptr(tx_mem)).idx);
-                if used_idx == deadline_used {
-                    self.tx_used_last = deadline_used;
-                    break;
-                }
-                spins += 1;
-                if spins > 50_000 {
-                    // Timed out — still mark as done to avoid deadlock
-                    self.tx_used_last = deadline_used;
-                    return false;
-                }
-                core::hint::spin_loop();
-            }
+            // Advance avail index to track the new outstanding TX.
+            // tx_used_last is updated asynchronously by reclaim_tx() on IRQ.
         }
         true
     }

@@ -710,29 +710,50 @@ unexpected_stub!(unexpected_vec254,254);
 // EOI order: drain FIFO first (clears the UART interrupt), then send EOI to
 // the master PIC so no further IRQ4 is lost during processing.
 
-/// Inner handler: drains RX FIFO and enqueues one IPC message per byte.
+/// Inner handler for vector 36 (IRQ4 — COM1).
+///
+/// Reads the IIR to determine the interrupt cause and dispatches:
+///  - IIR_THRE (0x02): TX holding register empty → drain TX ring via `tx_isr()`
+///  - IIR_RDA  (0x04) / IIR_CTI (0x0C): RX data → drain FIFO, send IPC to uart-drv
+///  - bit 0 set (no interrupt pending): spurious — ignore
+///
+/// The 16550A re-asserts IRQ4 for any still-pending interrupt type after the
+/// ISR returns, so handling one type per invocation is correct.
 extern "C" fn handle_uart_rx() {
-    if !hal::uart::rx_irq_pending() {
-        return; // Spurious; nothing to do.
-    }
+    let iir = hal::uart::read_iir();
 
-    let drv_pid = core_kernel::uart_irq::get_uart_drv_pid();
-    if drv_pid == u32::MAX {
-        // uart-drv not yet registered — discard bytes to clear the interrupt.
-        hal::uart::drain_rx_fifo(|_| {});
+    // Bit 0 set → no interrupt pending (spurious).
+    if iir & hal::uart::IIR_NONE != 0 {
         return;
     }
 
-    if let Some(sched) = core_kernel::scheduler::get_global() {
-        let from = core_kernel::process::ProcessId::new(0); // kernel pseudo-PID
-        let to   = core_kernel::process::ProcessId::new(drv_pid);
+    match iir & 0x0E {
+        // ── TX holding register empty ─────────────────────────────────────────
+        x if x == hal::uart::IIR_THRE => {
+            hal::uart::tx_isr();
+        }
 
-        hal::uart::drain_rx_fifo(|byte| {
-            let mut msg = core_kernel::ipc::Message::new(from);
-            msg.set_data(0, 0x02); // OP_UART_RX
-            msg.set_data(1, byte as u64);
-            sched.send_message(from, to, msg);
-        });
+        // ── RX data available or character timeout ────────────────────────────
+        x if x == hal::uart::IIR_RDA || x == hal::uart::IIR_CTI => {
+            let drv_pid = core_kernel::uart_irq::get_uart_drv_pid();
+            if drv_pid == u32::MAX {
+                // uart-drv not yet registered — discard to clear the interrupt.
+                hal::uart::drain_rx_fifo(|_| {});
+                return;
+            }
+            if let Some(sched) = core_kernel::scheduler::get_global() {
+                let from = core_kernel::process::ProcessId::new(0);
+                let to   = core_kernel::process::ProcessId::new(drv_pid);
+                hal::uart::drain_rx_fifo(|byte| {
+                    let mut msg = core_kernel::ipc::Message::new(from);
+                    msg.set_data(0, 0x02); // OP_UART_RX
+                    msg.set_data(1, byte as u64);
+                    sched.send_message(from, to, msg);
+                });
+            }
+        }
+
+        _ => {} // line status or modem status — ignore
     }
 }
 

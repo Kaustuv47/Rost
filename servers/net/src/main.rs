@@ -156,8 +156,10 @@ pub extern "C" fn _start() -> ! {
             // Check for kernel-delivered hardware IRQ notification:
             //   data[0] = 0xFFFF_0000 | gsi
             if (msg.data[0] >> 16) == 0xFFFF {
-                // IRQ fired — drain the RX ring immediately
+                // IRQ fired — reclaim completed TX descriptors then drain RX.
+                // Both TX completion and RX arrival share the same virtio IRQ.
                 if let Some(ref mut vnet) = vnet_opt {
+                    vnet.reclaim_tx();
                     poll_rx(vnet);
                 }
             } else if let Some(ref mut vnet) = vnet_opt {
