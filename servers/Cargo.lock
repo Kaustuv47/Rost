@@ -7,11 +7,31 @@ name = "hello-world"
 version = "0.1.0"
 
 [[package]]
+name = "rost-block-drv"
+version = "0.1.0"
+
+[[package]]
+name = "rost-gop"
+version = "0.1.0"
+
+[[package]]
 name = "rost-init"
 version = "0.1.0"
 
 [[package]]
+name = "rost-libc"
+version = "0.1.0"
+
+[[package]]
 name = "rost-net"
+version = "0.1.0"
+
+[[package]]
+name = "rost-pci-bus"
+version = "0.1.0"
+
+[[package]]
+name = "rost-ps2-kbd"
 version = "0.1.0"
 
 [[package]]

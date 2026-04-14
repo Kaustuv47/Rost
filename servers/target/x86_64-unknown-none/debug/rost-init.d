@@ -1,0 +1,1 @@
+/Users/kaustuv/Documents/Workspace/RustRover/Rost/servers/target/x86_64-unknown-none/debug/rost-init: /Users/kaustuv/Documents/Workspace/RustRover/Rost/servers/init/src/main.rs /Users/kaustuv/Documents/Workspace/RustRover/Rost/servers/init/src/syscall.rs

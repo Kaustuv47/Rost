@@ -23,6 +23,7 @@
 #![no_std]
 #![no_main]
 
+mod gop;
 mod io;
 mod shell;
 mod syscall;

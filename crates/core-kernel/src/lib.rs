@@ -18,3 +18,4 @@ pub mod scheduler;
 pub mod service_registry;
 pub mod irq_registry;
 pub mod uart_irq;
+pub mod framebuf;

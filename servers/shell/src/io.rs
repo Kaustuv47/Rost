@@ -15,12 +15,15 @@
 /// byte loss when the shell prints the banner or redraws the prompt (both
 /// of which emit far more than the 16-message queue depth in one burst).
 ///
+/// Also mirrors the byte to the GOP framebuffer server (fire-and-forget).
+///
 /// Input (keystrokes) still flows uart-drv → SYS_SEND → shell IPC queue,
 /// read back via `read_byte()` / `read_byte_blocking()`.
 ///
 /// No CR/LF translation.  Use `put_newline()` for a proper line break.
 pub fn put_byte(b: u8) {
     crate::syscall::uart_write(b);
+    crate::gop::write_byte(b);
 }
 
 /// Emit a proper newline: CR (\r) then LF (\n).
@@ -30,6 +33,9 @@ pub fn put_byte(b: u8) {
 pub fn put_newline() {
     crate::syscall::uart_write(b'\r');
     crate::syscall::uart_write(b'\n');
+    crate::gop::write_byte(b'\r');
+    crate::gop::write_byte(b'\n');
+    crate::gop::flush();
 }
 
 /// Write a string slice to the terminal.
@@ -59,10 +65,14 @@ pub fn read_byte() -> Option<u8> {
 
 /// Blocking read — yields the CPU until a byte arrives.
 ///
+/// Flushes the GOP buffer before blocking so that the prompt (which may not
+/// end with a newline) appears immediately on the framebuffer display.
+///
 /// Uses `timeout=u64::MAX` to block indefinitely.  While we are blocked
 /// the kernel marks us `Blocked` and does not schedule us, so we burn
 /// no CPU time waiting for input.
 pub fn read_byte_blocking() -> u8 {
+    crate::gop::flush();
     loop {
         let v = crate::syscall::recv(u64::MAX);
         if v != u64::MAX {

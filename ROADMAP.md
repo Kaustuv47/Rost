@@ -277,6 +277,8 @@ ring 0 and ring 3.
       — permissive passthrough mode (equivalent to no IOMMU security-wise but proves
         hardware enable path; per-device restriction is a future patch)
       — all IOMMU_BASES[..IOMMU_COUNT] MMIO pages explicitly mapped before iommu::init()
+      — SRTP/WBF/TE GSTS handshakes bounded at 100 000 iterations; log+return false on breach
+          (IEC 61508 §7.4.1: all kernel busy-waits must have a defined upper bound)
       — IEC 61508 §7.4.3: DMA remapping infrastructure installed at boot
       — 4 unit tests: root_entry_present, root_entry_alignment,
         passthrough_ctx_entry, passthrough_ctx_domain_id
@@ -315,6 +317,16 @@ must never halt the system.
       — timer ISR: save caller-saved, inc TICK_COUNT, EOI, call tick_scheduler_isr, restore, iretq
       — tick_scheduler_isr() uses switch_context_noints (no sti) so IRETQ restores IF
       — switch_context_noints: CLI + callee-saved save/restore + optional CR3 load, no STI
+[x] UART TX interrupt-driven (vector 36, COM1 ETBEI)
+      — COM1 IRQ (ISA IRQ4) routed to vector 36 via IOAPIC; single handler serves both RX and TX
+      — handle_uart_rx() reads IIR register to dispatch:
+          IIR_THRE (0x02) → hal::uart::tx_isr() drains TX ring buffer
+          IIR_RDA  (0x04) / IIR_CTI (0x0C) → drain RX FIFO + IPC to uart-drv
+          bit 0 set → spurious, no-op
+      — put_byte() never spins; pushes to 255-byte SPSC ring; arms ETBEI (IER bit 1)
+        and pump-primes by writing one byte directly if THRE is currently set
+      — tx_isr() pops next byte from ring, writes to COM1 THR; disables ETBEI when empty
+      — ETBEI armed on-demand; disabled when ring empties → no spurious THRE interrupts
 [x] Spurious interrupt handler (vector 255) — iretq only, no EOI (LAPIC spurious)
 [x] MAX_ISR_LATENCY (pub static AtomicU64) — placeholder for latency measurement
 ```
@@ -349,11 +361,15 @@ Creates and destroys processes; owns per-process state for the kernel's lifetime
 [x] TSS.RSP0 update   (see §4 — tick_scheduler_isr() updates RSP0 on every context switch)
 [x] Per-process PML4  (page_table_base threaded through; ELF loader creates fresh PML4 per process;
                        kernel PD/PDPT/PML4 entries merged in so syscall handlers work with user CR3)
-[~] Resource reclaim on terminate
+[x] Resource reclaim on terminate
       — PCB slot cleared (table slot → None); kernel stack zeroed + reclaimed ✓
-      — global_free_4k() available for page-frame reclaim ✓
-      — PCB does not yet track per-process page-table / user-stack frame addresses
-      — Full reclaim requires a PML4 walk or a per-PCB frame list (future work)
+      — global_free_4k() called for every tracked user frame on PCB drop ✓
+      — PCB.user_frames[96] tracks ELF segment pages + user stack pages + PML4 frame
+          added by spawn_elf via Scheduler::register_user_frames(pid, frames)
+      — PCB.pml4_owned = true for ring-3 processes; page_table_base frame freed in Drop
+      — Intermediate page-table frames (PDPT/PD/PT) not yet tracked (minor residual leak)
+          these are allocated by map_page_global and tracked via FRAME_TAGS as KernelData
+      — IEC 61508 §7.4.5: physical memory footprint is reclaimed on every process termination
 [x] Guard page per kernel stack   (see §3 — split_huge_page_global + unmap_page)
 [x] Capability table in PCB
       — CapKind enum: None/Channel/Process/Memory/Service; CAP_R/W/G/X rights bitmask
@@ -614,17 +630,39 @@ The hardware boundary between ring 3 and ring 0.
                           creates CapKind::Channel (CAP_W) in caller's table
                           ENOENT if name not found; ENOMEM if cap table full
 [x] SYS_SPAWN_ELF       (26) — load ring-3 ELF image from caller's user-space buffer
-[x] SYS_RESTART_SERVER  (27) — restart a named server from the kernel's embedded ELF image
-                                a0=ptr to 16-byte null-padded service name
-                                kernel hook maps "uart-drv"/"rost-vfs"/"rost-shell" → ELF data
-                                returns new PID; EINVAL if name unknown or table full
-                                registered alongside SYS_SPAWN_ELF hook at Stage 6
                           a0=elf_data_ptr, a1=elf_data_len, a2=priority (0=default 128)
                           validates user pointer; reads ELF with STAC active
                           uses core_kernel::elf_spawn hook (avoids arch→kernel circular dep)
                           hook registered at Stage 6 before first server spawn
                           returns new PID on success; EINVAL on parse fail or table full
                           ring-3 wrapper: syscall::spawn_elf(buf, priority) → Option<u32>
+[x] SYS_RESTART_SERVER  (27) — restart a named server from the kernel's embedded ELF image
+                                a0=ptr to 16-byte null-padded service name
+                                kernel hook maps "uart-drv"/"rost-vfs"/"rost-shell" → ELF data
+                                returns new PID; EINVAL if name unknown or table full
+                                registered alongside SYS_SPAWN_ELF hook at Stage 6
+[x] SYS_LIST_PROCS      (28) — snapshot the process table into a caller-supplied buffer
+                                returns 24-byte entries (pid, state, priority, cpu_ticks)
+                                used by shell `ps` command to enumerate all live processes
+[x] SYS_IOPORT_OUT      (29) — write one byte to an x86 I/O port from ring-3
+                                a0=port (u16), a1=value (u8)
+                                used by rost-net virtio-net driver (BAR0 I/O port access)
+[x] SYS_IOPORT_IN       (30) — read one byte from an x86 I/O port from ring-3
+                                a0=port (u16); returns byte value
+                                used by rost-net to read virtio config + ISR status register
+[x] SYS_PHYS_ADDR       (31) — translate a virtual address to its physical address
+                                a0=vaddr; returns phys addr (walks calling process's PML4)
+                                used by rost-net to compute DMA-safe descriptor/buffer addresses
+[x] SYS_IRQ_REGISTER    (32) — claim a GSI and route it to the calling process
+                                a0=GSI (8-15), a1=ISR port (I/O port to read for IRQ status)
+                                registers caller PID in irq_registry; programs IOAPIC redirect
+                                entry: GSI → vector (32+GSI); GSI 0-7 rejected (EINVAL)
+                                used by rost-net and rost-block-drv for interrupt delivery
+[x] SYS_GET_FRAMEBUF    (33) — get primary GOP framebuffer descriptor into a user struct
+                                a0=pointer to 32-byte FbQueryResult {base:u64, size:u64,
+                                width:u32, height:u32, stride:u32, format:u32}
+                                returns 0 on success; ENODEV (u64::MAX-5) if no framebuffer
+                                core_kernel::framebuf populated from UEFI GOP at boot Stage 0
 ```
 
 ---
@@ -797,8 +835,10 @@ None of them add features — they make the existing features safe enough to cer
                                cap_table_full_returns_none, cap_slot_reuse_after_revoke
       [x] memory/pool.rs     — 1 test (consolidated): LIFO order, exhaustion→None,
                                free+realloc, overflow spills to global allocator
-      [x] process/pcb.rs     — 3 tests: free out-of-range safe, stack zeroed on free,
-                               reclaim LIFO reuse; Drop impl automatically frees stack slot
+      [x] process/pcb.rs     — 3 tests: free out-of-range safe,
+                               stack zeroed on alloc-from-reclaim (not on free — deferred for
+                                 stack-corruption safety; verified at re-alloc time),
+                               reclaim LIFO reuse; Drop frees kernel stack + user frames + PML4
       [x] acpi/hpet.rs       — 8 tests: null/bad-sig/bad-checksum/too-short, non-memory GAS
                                rejected, zero period rejected, period_too_large rejected,
                                valid 10 MHz (QEMU), valid 14 MHz, boundary period accepted
@@ -951,8 +991,13 @@ Parses ELF64 images and launches them as new processes.
                                so syscall handlers access kernel memory when CR3=user PML4)
 [x] IRETQ trampoline          (ring3_entry_trampoline: pushes IRETQ frame, CS=0x23, SS=0x1B, iretq)
 [x] read_unaligned ELF header parse (1-byte aligned include_bytes! data, ELFCLASS64 struct)
-[ ] Dynamic linking stub      (initially: require static ELF only; dynamic = future)
-[ ] sys_exec(path, argv)      — syscall wrapper that the shell and init use
+[~] Dynamic linking stub      (static ELF only required; ET_DYN / PLT relocation = future)
+[x] sys_exec(path, argv)     — ring-3 exec wrapper in servers/libc/src/unistd.rs
+      — exec(path: *const u8, priority: u8) → !
+      — opens path via VFS (OP_OPEN / OP_READ_FD), reads into 512 KB malloc'd buffer
+      — validates ELF magic, calls exec_elf (SYS_SPAWN_ELF=26), then SYS_EXIT(0)
+      — replaces the calling process (caller does not return on success)
+      — argv passing not yet supported (spawned process receives no arguments)
 ```
 
 ---
@@ -1181,43 +1226,100 @@ Virtual filesystem IPC server; runs as ring-3 ELF binary (PID 4 by convention).
 All drivers run in ring 3.  A driver crash cannot take down the kernel.
 
 ```
-[ ] Driver model
+[x] Driver model
       — drivers register with init via SYS_REGISTER; receive IRQ notifications via IPC
-      — kernel forwards hardware IRQs to registered driver processes
+      — kernel irq_registry module: maps GSI 8-15 → (owner PID, isr_port) via AtomicU32/AtomicU16
+      — SYS_IRQ_REGISTER (32): ring-3 driver claims GSI, kernel programs IOAPIC redirect entry
+      — kernel forwards IRQ to owner via IPC message (data[0] = 0xFFFF_0000 | gsi)
 [x] uart-drv server (PID 3 by convention)  — servers/uart-drv, spawned by kernel via ELF loader
       — registers as "uart-drv" via SYS_REGISTER(10) at startup
       — main loop: drain SYS_RECV_MSG(0) write requests (OP_WRITE=0x01) → SYS_UART_WRITE(12)
       — IRQ-driven RX: UART ISR (vector 36, via IOAPIC) drains COM1 FIFO and sends one
           OP_UART_RX IPC message per byte to uart-drv; uart-drv forwards each byte to the
           foreground shell via SYS_SEND — zero-latency input, no polling required
+      — IRQ-driven TX: COM1 ISR also handles THRE (TX holding register empty) interrupt;
+          hal::uart::tx_isr() drains the 255-byte SPSC ring buffer one byte at a time;
+          ETBEI (IER bit 1) armed by put_byte(), disarmed when ring empties — no busy-wait
       — IOAPIC routing: route_irq(ioapic_base, pin=4, vector=36, lapic=0) wires ISA IRQ4
           (COM1) to the LAPIC at boot (main.rs Stage 3, after ioapic::init())
       — uart_rx_isr() context-switches immediately to uart-drv after FIFO drain so
           keystrokes reach the shell within one scheduler quantum
       — looks up shell PID via SYS_LOOKUP("rost-shell")
       — priority 64 (equal to shell)
-[ ] Block device driver   (ATA PIO or virtio-blk for QEMU)
-[ ] GOP framebuffer driver
-      — maps framebuffer physical address via SYS_MAP
-      — exposes blit / fill / draw-text IPC interface
-[ ] PS/2 keyboard driver  (or USB HID via xHCI — long term)
+[x] PCI bus server        (servers/pci-bus, "pci-bus")
+      — scans bus 0-255 via I/O ports 0xCF8/0xCFC; multi-function aware (header type bit 7)
+      — IPC: OP_PCI_FIND(0x60) → RESP_PCI_BDF(0x91); OP_PCI_READ(0x61) → RESP_PCI_DATA(0x92)
+             OP_PCI_WRITE(0x62) → RESP_OK(0x85); OP_PCI_ENUMERATE(0x63) → RESP_PCI_ENUM(0x93)
+      — BDF encoding: bus[23:16] | dev[12:8] | func[2:0]
+      — priority 72; spawned after rost-net
+[x] Block device driver   (servers/block-drv, "block-drv" — virtio-blk PCI 0x1AF4/0x1001)
+      — VFS-compatible IPC: OP_BLK_READ(0x50) with (lba, byte_offset) → RESP_BLK_DATA(0x90)
+          with (512, chunk_len, 40-byte data); 13 round-trips per sector via SYS_CALL
+      — virtio-blk legacy init: PCI find → BAR0 I/O → reset → DRIVER features → queue setup
+          → DRIVER_OK; 3-descriptor chain (req_hdr + sector_buf + status_byte) per request
+      — single-slot sector cache eliminates re-fetching the same sector for 13-chunk reads
+      — interrupt-driven: SYS_IRQ_REGISTER with PCI interrupt line (GSI 8-15 range);
+          polling fallback if GSI out of range
+      — VFS falls back to static ROM tree if block-drv not registered (blk::available() → false)
+      — priority 72
+[x] GOP framebuffer driver (servers/gop, "gop")
+      — SYS_GET_FRAMEBUF (33): new syscall writes FbQueryResult{base,size,w,h,stride,fmt} to user ptr
+      — kernel populates core_kernel::framebuf statics at boot from UEFI GOP descriptor
+      — maps GOP framebuffer physical pages into VA 0x4000_0000 via SYS_MAP(vaddr, paddr, 0x3)
+      — built-in 8×16 bitmap font (95 glyphs, CP437 ASCII subset); solid-block fallback
+      — IPC: OP_GOP_PUTCHAR(0x70), OP_GOP_PUTS(0x71), OP_GOP_CLEAR(0x72),
+             OP_GOP_SET_COLOR(0x73) ARGB, OP_GOP_GET_SIZE(0x74) → RESP_GOP_SIZE(0xA0)
+      — automatic scroll: memmove rows upward when cursor reaches bottom
+      — priority 80 (lower — rendering does not need tight latency)
+[x] PS/2 keyboard driver  (servers/ps2-kbd, "ps2-kbd" — stub)
+      — polls PS/2 status port 0x64 (OBF bit) and data port 0x60 via SYS_IOPORT_IN
+          (ISA IRQ 1 / GSI 1 is below SYS_IRQ_REGISTER's 8-15 range; polling fallback)
+      — scan-code set 1 → ASCII translation table (US QWERTY, 80 keys)
+      — 16-byte scan-code ring buffer; extended (0xE0) prefix handling
+      — IPC: OP_KBD_REGISTER(0x80) set foreground PID, OP_KBD_UNREGISTER(0x81),
+             OP_KBD_GET_SCANCODE(0x82) → RESP_KBD_SCANCODE(0xB0) / RESP_EMPTY(0xB1)
+      — forwards ASCII to foreground PID via SYS_SEND (compatible with uart-drv byte model)
+      — priority 80; supplementary to uart-drv (COM1 is primary keyboard input path)
 [x] virtio-net driver     (QEMU networking — rost-net server, PID 6)
-[ ] PCI bus enumeration   (scan, read config space, allocate BARs)
+[x] SYS_GET_FRAMEBUF (33) — get primary GOP framebuffer descriptor into user FbQueryResult struct
+      — a0 = pointer to 32-byte {base:u64, size:u64, width:u32, height:u32, stride:u32, fmt:u32}
+      — returns 0 on success, ENODEV (u64::MAX-5) if no display found at UEFI boot time
+      — core_kernel::framebuf module: AtomicU64/AtomicU32 statics; set_primary() / get_primary()
 ```
 
 ---
 
 ### 19  GOP Framebuffer Console
 
-Visible output in the QEMU window (currently blank — serial only).
+Visible output in the QEMU window — full VT100 terminal emulator and kernel panic screen.
 
 ```
-[ ] Map GOP framebuffer into display driver address space via SYS_MAP
-[ ] PSF2 bitmap font (PC Screen Font — compact, public domain)
-[ ] Text renderer     (glyph blit, cursor, scroll)
-[ ] Terminal emulator (subset of VT100 — enough for the shell)
-[ ] Panic screen      (kernel writes directly to framebuffer on fatal error,
-                       bypassing the driver server)
+[x] Map GOP framebuffer into display driver address space via SYS_MAP
+      — GOP physical base from SYS_GET_FRAMEBUF (33); pages mapped 4 KB at a time
+      — VA 0x4000_0000 reserved for GOP server framebuffer window
+[x] Built-in bitmap font (8×16, 95 CP437 glyphs — not PSF2, embedded in binary)
+[x] Text renderer     (glyph blit, cursor tracking, auto-scroll via memmove)
+[x] Terminal emulator (VT100/ANSI subset — servers/gop/src/vt100.rs)
+      — State machine: Normal → Esc → Csi; callback-driven event dispatch
+      — CSI cursor: A/B/C/D (up/down/right/left), E/F (next/prev line),
+                    G (column), H/f (position), s/u (save/restore)
+      — CSI erase: J (display 0=below/1=above/2=all), K (line 0=right/1=left/2=all)
+      — CSI delete: P (delete chars)
+      — CSI scroll: S (up), T (down)
+      — CSI SGR: reset(0), bold(1), reverse(7/27), fg 30-37/39/90-97,
+                  bg 40-47/49/100-107
+      — ESC 7/8: save/restore cursor; ESC c: full reset
+      — Control chars: CR, LF, HT, BS, BEL
+[x] Shell → GOP output forwarding (servers/shell/src/gop.rs)
+      — Fire-and-forget OP_GOP_PUTS; 40-byte batch buffer
+      — Lazy PID lookup; flush before blocking on input (prompt visible)
+      — All put_byte() and put_newline() calls mirror to GOP framebuffer
+[x] Panic screen (kernel writes directly to framebuffer on fatal exception,
+                  bypassing the driver server — servers/core-kernel/src/framebuf.rs)
+      — Embedded 8×8 bitmap font (96 glyphs, ASCII 0x20–0x7F, 768 bytes)
+      — Framebuffer MMIO identity-mapped in Stage 4 via map_page_global
+      — Dark red background, white/yellow/green text; shows label, RIP, ERR, CR2, PID
+      — Called from #DE, #GP, #PF, #DF handlers (fatal ring-0 and ring-3 kernel paths)
 ```
 
 ---
@@ -1241,7 +1343,10 @@ Visible output in the QEMU window (currently blank — serial only).
 [x] Async ping           (non-blocking OP_NET_PING: state machine WaitARP→WaitICMP→Idle;
                            reply sent asynchronously when ARP/ICMP packets arrive via IRQ;
                            2-second deadline checked each main-loop iteration)
-[x] TX spin reduction    (virtio TX used-ring poll: 500 000 → 50 000 iterations ~5 ms cap)
+[x] Virtio TX interrupt-driven  (non-blocking send_packet + IRQ-driven reclaim_tx)
+      — send_packet(): calls reclaim_tx() then checks ring space, kicks queue, returns immediately
+      — reclaim_tx(): reads TX used-ring idx, advances tx_used_last; called from IRQ notify path
+      — ring-space guard: returns false if >128 descriptors in-flight
       — rost-net registered as "rost-net" in service registry; spawned as PID 6
       — QEMU: -netdev user,id=net0 -device virtio-net-pci,netdev=net0
       — Guest IP: 10.0.2.15; gateway 10.0.2.2 (default ping target)
@@ -1293,7 +1398,7 @@ delivery where possible.
       — Calls set_ioapic_base(ioapic_base) after ioapic::init() to publish base for SYS_IRQ_REGISTER
 ```
 
-#### Infrastructure added (pass 3 — this milestone)
+#### Infrastructure added (pass 2 — blocking loop elimination)
 
 ```
 [x] IOMMU GSTS safety timeouts   (core-kernel/src/iommu/mod.rs)
@@ -1314,7 +1419,7 @@ delivery where possible.
       — Both ARP and SYN-ACK phases now driven by hardware IRQ → poll_rx → handle_packet
 ```
 
-#### Infrastructure added (pass 3 — UART TX + Virtio TX)
+#### Infrastructure added (pass 3 — UART TX + Virtio TX interrupt-driven)
 
 ```
 [x] UART TX interrupt-driven    (crates/hal/src/uart.rs)
@@ -1348,17 +1453,77 @@ delivery where possible.
 
 ---
 
-### 22  POSIX Compatibility Layer  (long term)
+### 22  POSIX Compatibility Layer
 
-Thin library that maps POSIX calls onto Rost syscalls.
-Runs entirely in user space; nothing in ring 0.
+Thin library (`servers/libc`, crate `rost-libc`) that maps standard C/POSIX
+interfaces onto Rost syscalls.  Runs entirely in ring 3; nothing in ring 0.
+Link as `rlib`; other server crates add `rost-libc` as a dependency.
 
 ```
-[ ] libc subset  (malloc via SYS_MAP, free, memcpy, string.h)
-[ ] pthread subset  (threads within a process share address space — requires kernel TLS)
-[ ] POSIX signals  (mapped to IPC notifications from init)
-[ ] fork / exec  (fork = copy address space; exec = ELF loader)
-[ ] File I/O  (wraps VFS server IPC)
+[x] libc subset (malloc.rs)
+      — Heap: virtual addresses 0x0080_0000 and up, grown via SYS_MAP(vaddr, 0, W|U)
+      — BlockHdr (16B) prefix before every allocation; size rounded to 16-byte boundary
+      — 9 size classes (8–2048 B): segregated SPSC free lists via AtomicUsize heads
+      — Large allocations (>2048 B): bump-allocated directly, marked free but not recycled
+      — malloc / free / calloc / realloc — C-ABI #[no_mangle] symbols
+      — calloc zero-fills via core::ptr::write_bytes
+      — realloc: if new ≤ old, return same pointer; else malloc + copy + free
+[x] string.h subset (string.rs)
+      — memcpy / memmove / memset / memcmp / memchr
+      — strlen / strcpy / strncpy / strcat / strncat
+      — strcmp / strncmp / strchr / strrchr / strstr
+      — Safe Rust helpers: str_len(bytes) / str_eq(a, b) (null-terminated byte slices)
+[x] errno (errno.rs)
+      — POSIX error constants: EPERM / ENOENT / EIO / ENOMEM / EACCES / EBADF / EINVAL / ENOSYS / …
+      — AtomicI32 per-process storage (single-threaded; no true concurrency)
+      — errno() / set_errno(e) / clear_errno() Rust accessors
+      — C-ABI symbol: __errno_location() → *mut i32 for C code that uses errno macro
+[x] File I/O (fcntl.rs, vfs.rs, unistd.rs)
+      — VFS IPC client (vfs.rs): lazy-resolves "rost-vfs" PID; wraps OP_OPEN / OP_CLOSE /
+          OP_READ_FD / OP_WRITE_FD / OP_SEEK / OP_FSTAT / OP_STAT via SYS_CALL(17)
+      — POSIX fd table: 32 slots (fds 3–31 map to VFS fd numbers; 0/1/2 handled directly)
+      — open(path, flags, mode) → fd  (O_RDONLY / O_WRONLY / O_RDWR / O_CREAT / O_TRUNC / O_APPEND)
+      — close(fd) → 0/-1
+      — read(fd, buf, count): fd 0 = uart-drv SYS_RECV poll; fd ≥ 3 = VFS OP_READ_FD chunks
+      — write(fd, buf, count): fd 1/2 = SYS_UART_WRITE; fd ≥ 3 = VFS OP_WRITE_FD chunks
+      — lseek(fd, offset, SEEK_SET) → new offset  (SEEK_CUR/END return EINVAL — VFS is stateful)
+[x] stdio helpers (stdio.rs)
+      — puts / putchar / fputs — null-terminated C-string output
+      — fwrite / fread — block I/O via write/read
+      — WriteFmt: core::fmt::Write adapter → write!(WriteFmt::stdout(), ...) works from Rust
+      — print_dec / print_hex / print_str / print_bytes — fast direct-UART helpers
+[x] Process primitives (unistd.rs)
+      — getpid() → pid_t  (SYS_GETPID)
+      — exit() / _exit()  (SYS_EXIT)
+      — sleep(secs) / usleep(usecs)  (SYS_RECV timeout)
+      — clock_monotonic_ns() / uptime_secs()  (SYS_CLOCK)
+      — sbrk(n): delegates to malloc for positive increments; returns heap break for n ≤ 0
+      — exec_elf(buf, priority): spawns new ring-3 process via SYS_SPAWN_ELF (26)
+[x] POSIX signals (signal.rs)
+      — Signal numbers: SIGHUP/SIGINT/SIGQUIT/SIGTERM/SIGUSR1/SIGUSR2/SIGCHLD/SIGALRM/SIGKILL
+      — Mapped to notification bits: sig_to_bit() / bit_to_sig()
+      — signal(signum, handler): stores fn ptr in static HANDLERS table (SIG_DFL/SIG_IGN/ptr)
+      — kill(pid, sig): SYS_NOTIFY(pid, 1 << bit)
+      — raise(sig): kill(getpid(), sig)
+      — signal_dispatch(): polls notification word via SYS_RECV(0); invokes handlers cooperatively
+          SIG_DFL → exit(128+sig); SIG_IGN → discard; fn ptr → call handler; SIGKILL → always halt
+[x] pthread subset (pthread.rs)
+      — pthread_mutex_t: AtomicUsize CAS spinlock (#[repr(C)], 8 bytes)
+      — pthread_mutex_init / destroy / lock / trylock / unlock
+      — pthread_mutex_lock: spin + yield_cpu() (safe on single-core; Rost enforces 1 CPU)
+      — pthread_self() → pid cast to pthread_t
+      — pthread_equal(t1, t2) → c_int
+      — pthread_once: CAS-based one-time init (safe on single-core)
+      — pthread_exit(retval): calls exit(0)
+[~] fork / exec
+      — exec_elf(buf, priority): available — spawns a new process but current process continues
+      — exec(path, priority): available (servers/libc/src/unistd.rs) — reads ELF from VFS,
+          spawns new process via SYS_SPAWN_ELF, then SYS_EXIT(0) — caller does not return
+      — fork: NOT implemented — no COW page tables; returns ENOSYS if called
+          (full fork requires kernel SYS_FORK + copy-on-write PML4 walk — future work)
+[~] pthread_create / pthread_join
+      — Processes do not share address space; pthread_create returns ENOSYS
+      — Alternative: use exec_elf + IPC for structured concurrency
 ```
 
 ---

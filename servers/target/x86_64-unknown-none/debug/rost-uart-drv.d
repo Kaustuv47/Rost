@@ -1,0 +1,1 @@
+/Users/kaustuv/Documents/Workspace/RustRover/Rost/servers/target/x86_64-unknown-none/debug/rost-uart-drv: /Users/kaustuv/Documents/Workspace/RustRover/Rost/servers/uart-drv/src/main.rs /Users/kaustuv/Documents/Workspace/RustRover/Rost/servers/uart-drv/src/syscall.rs

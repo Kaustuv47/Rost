@@ -39,6 +39,18 @@ static SHELL_ELF: &[u8] = include_bytes!(
 static NET_ELF: &[u8] = include_bytes!(
     "../../../servers/target/x86_64-unknown-none/debug/rost-net"
 );
+static PCI_BUS_ELF: &[u8] = include_bytes!(
+    "../../../servers/target/x86_64-unknown-none/debug/rost-pci-bus"
+);
+static BLOCK_DRV_ELF: &[u8] = include_bytes!(
+    "../../../servers/target/x86_64-unknown-none/debug/rost-block-drv"
+);
+static GOP_ELF: &[u8] = include_bytes!(
+    "../../../servers/target/x86_64-unknown-none/debug/rost-gop"
+);
+static PS2_KBD_ELF: &[u8] = include_bytes!(
+    "../../../servers/target/x86_64-unknown-none/debug/rost-ps2-kbd"
+);
 
 use arch_x86_64::cpu::{GlobalDescriptorTable, InterruptDescriptorTable};
 use core_kernel::boot_info::BootInfo;
@@ -106,6 +118,14 @@ static mut IOAPIC_GSI_BASE: u32 = 0;
 /// 0 means the FADT was not found or the PM timer block is absent.
 /// Used by the future TSC calibration routine (§10) and SYS_CLOCK improvement.
 static mut PM_TIMER_PORT: u32 = 0;
+
+/// Physical base address of the primary GOP framebuffer MMIO region.
+///
+/// Set in Stage 0 alongside `set_primary()`.  Used in Stage 4 to explicitly
+/// map the framebuffer MMIO into the kernel PML4 (it may not be in the
+/// conventional UEFI memory map that Stage 1 identity-maps).
+static mut FB_PHYS_ADDR: u64 = 0;
+static mut FB_PHYS_SIZE: u64 = 0;
 
 /// Physical base addresses of discovered Intel VT-d IOMMU controllers, from DMAR.
 ///
@@ -300,6 +320,18 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
         hal::uart::print_str("  [");
         hal::uart::print_dec(boot_info.displays.len() as u64);
         hal::uart::print_str(" output(s)]\n");
+        // Publish framebuffer info for SYS_GET_FRAMEBUF (33).
+        let fmt = match fb.format {
+            core_kernel::boot_info::FrameBufferFormat::Rgb32    => core_kernel::framebuf::FMT_RGB32,
+            core_kernel::boot_info::FrameBufferFormat::Bgr32    => core_kernel::framebuf::FMT_BGR32,
+            core_kernel::boot_info::FrameBufferFormat::Bitmask { .. } => core_kernel::framebuf::FMT_BITMASK,
+            core_kernel::boot_info::FrameBufferFormat::BltOnly  => core_kernel::framebuf::FMT_BLTONLY,
+        };
+        core_kernel::framebuf::set_primary(fb.base, fb.size, fb.width, fb.height, fb.stride, fmt);
+        unsafe {
+            FB_PHYS_ADDR = fb.base;
+            FB_PHYS_SIZE = fb.size as u64;
+        }
     } else {
         hal::uart::print_str("      ├─ Display (GOP):   Not found\n");
     }
@@ -829,6 +861,34 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
     // QEMU: add `-device ib700,id=watchdog0 -watchdog-action reset` to scripts/run.sh.
     hal::watchdog::init(10);
     hal::uart::print_str("      └─ Watchdog:        iB700 armed (10 s timeout, kick every 500 ms)\n");
+
+    // Map the GOP framebuffer MMIO into the kernel PML4 so that panic_screen()
+    // can write to it without going through the ring-3 GOP server.
+    // The framebuffer typically lives outside the conventional UEFI memory map,
+    // so Stage 1's identity-map loop may not have covered it.
+    {
+        let fb_base = unsafe { FB_PHYS_ADDR };
+        let fb_size = unsafe { FB_PHYS_SIZE };
+        if fb_base != 0 && fb_size != 0 {
+            let pml4 = unsafe { &mut *core::ptr::addr_of_mut!(KERNEL_PML4) };
+            let pages = (fb_size + 0xFFF) / 0x1000;
+            for i in 0..pages {
+                let addr = fb_base + i * 0x1000;
+                core_kernel::memory::map_page_global(
+                    pml4,
+                    addr,
+                    addr,
+                    core_kernel::memory::PTE_PRESENT | core_kernel::memory::PTE_WRITABLE,
+                );
+            }
+            // Identity-mapped: virt == phys
+            core_kernel::framebuf::set_kernel_fb_virt(fb_base);
+            hal::uart::print_str("      └─ Framebuffer:     panic screen enabled at ");
+            hal::uart::print_hex(fb_base);
+            hal::uart::print_str("\n");
+        }
+    }
+
     hal::uart::print_str("      └─ Status:          ✓ OK\n\n");
 
     // -------------------------------------------------------------------------
@@ -907,6 +967,30 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
         hal::uart::print_str("      [WARN] rost-net ELF load failed\n");
     }
 
+    hal::uart::print_str("      └─ Spawning rost-pci-bus...\n");
+    let pci_bus_pid = elf::spawn_elf(PCI_BUS_ELF, 72); // priority 72: device servers
+    if pci_bus_pid.is_none() {
+        hal::uart::print_str("      [WARN] rost-pci-bus ELF load failed\n");
+    }
+
+    hal::uart::print_str("      └─ Spawning rost-block-drv...\n");
+    let block_drv_pid = elf::spawn_elf(BLOCK_DRV_ELF, 72);
+    if block_drv_pid.is_none() {
+        hal::uart::print_str("      [WARN] rost-block-drv ELF load failed\n");
+    }
+
+    hal::uart::print_str("      └─ Spawning rost-gop...\n");
+    let gop_pid = elf::spawn_elf(GOP_ELF, 80); // lower priority: display rendering
+    if gop_pid.is_none() {
+        hal::uart::print_str("      [WARN] rost-gop ELF load failed\n");
+    }
+
+    hal::uart::print_str("      └─ Spawning rost-ps2-kbd...\n");
+    let ps2_kbd_pid = elf::spawn_elf(PS2_KBD_ELF, 80);
+    if ps2_kbd_pid.is_none() {
+        hal::uart::print_str("      [WARN] rost-ps2-kbd ELF load failed\n");
+    }
+
     // Set TSS.RSP0, CURRENT_PID, and the scheduler's internal current_process
     // to the idle process so that the first timer tick advances idle's cpu_time
     // and preempts it in favour of init / uart-drv / shell.
@@ -943,6 +1027,21 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
     hal::uart::print_str("\n");
     hal::uart::print_str("      └─ rost-shell:      PID ");
     if let Some(p) = shell_pid { hal::uart::print_hex(p.as_u32() as u64); }
+    hal::uart::print_str("\n");
+    hal::uart::print_str("      └─ rost-net:        PID ");
+    if let Some(p) = net_pid { hal::uart::print_hex(p.as_u32() as u64); }
+    hal::uart::print_str("\n");
+    hal::uart::print_str("      └─ pci-bus:         PID ");
+    if let Some(p) = pci_bus_pid { hal::uart::print_hex(p.as_u32() as u64); }
+    hal::uart::print_str("\n");
+    hal::uart::print_str("      └─ block-drv:       PID ");
+    if let Some(p) = block_drv_pid { hal::uart::print_hex(p.as_u32() as u64); }
+    hal::uart::print_str("\n");
+    hal::uart::print_str("      └─ gop:             PID ");
+    if let Some(p) = gop_pid { hal::uart::print_hex(p.as_u32() as u64); }
+    hal::uart::print_str("\n");
+    hal::uart::print_str("      └─ ps2-kbd:         PID ");
+    if let Some(p) = ps2_kbd_pid { hal::uart::print_hex(p.as_u32() as u64); }
     hal::uart::print_str("\n");
     hal::uart::print_str("      └─ TSS.RSP0:        Updated per context switch\n");
     hal::uart::print_str("      └─ Status:          ✓ OK\n\n");

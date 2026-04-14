@@ -1,0 +1,14 @@
+[package]
+name    = "rost-libc"
+version = "0.1.0"
+edition = "2021"
+
+# Thin POSIX compatibility library that maps standard C interfaces onto Rost
+# syscalls.  Runs entirely in ring 3; nothing touches the kernel directly except
+# through the defined syscall ABI.
+#
+# Link as an rlib so Rust server crates can `use rost_libc::...` or let the
+# C-ABI `#[no_mangle]` symbols be resolved when linking against a C object file.
+[lib]
+name       = "rost_libc"
+crate-type = ["rlib"]

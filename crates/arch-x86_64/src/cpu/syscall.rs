@@ -96,6 +96,7 @@ const SYS_IOPORT_OUT:      u64 = 29; // proxy port I/O write for ring-3 drivers 
 const SYS_IOPORT_IN:       u64 = 30; // proxy port I/O read  for ring-3 drivers (port, width)
 const SYS_PHYS_ADDR:       u64 = 31; // translate virtual → physical address (for DMA setup)
 const SYS_IRQ_REGISTER:    u64 = 32; // register PCI IRQ handler: a0=GSI, a1=ISR port
+const SYS_GET_FRAMEBUF:    u64 = 33; // get primary GOP framebuffer info → user struct (a0=ptr)
 
 // Error codes
 const ENOSYS:    u64 = u64::MAX;      // -1: function not implemented
@@ -1392,6 +1393,38 @@ extern "sysv64" fn dispatch_syscall(
                 unsafe {
                     crate::apic::ioapic::route_irq(ioapic_base, gsi, (32 + gsi) as u8, 0);
                 }
+            }
+            0
+        }
+
+        // SYS_GET_FRAMEBUF — return the primary GOP framebuffer descriptor.
+        //
+        // a0 = pointer to a 32-byte user-mode FbQueryResult struct:
+        //   offset  0: u64  base   — physical base address of the framebuffer
+        //   offset  8: u64  size   — total size in bytes
+        //   offset 16: u32  width  — horizontal resolution in pixels
+        //   offset 20: u32  height — vertical resolution in pixels
+        //   offset 24: u32  stride — pixels per scan line (≥ width)
+        //   offset 28: u32  format — 0=Rgb32, 1=Bgr32, 2=Bitmask, 3=BltOnly
+        //
+        // Returns 0 on success, ENODEV if no framebuffer was discovered at boot.
+        SYS_GET_FRAMEBUF => {
+            const STRUCT_SIZE: usize = 32;
+            if !validate_user_ptr(a0, STRUCT_SIZE, 8) { return EINVAL; }
+
+            let fb = match core_kernel::framebuf::get_primary() {
+                Some(f) => f,
+                None    => return u64::MAX - 5, // ENODEV
+            };
+
+            let p = a0 as *mut u8;
+            unsafe {
+                core::ptr::write_unaligned(p.add(0)  as *mut u64, fb.base);
+                core::ptr::write_unaligned(p.add(8)  as *mut u64, fb.size);
+                core::ptr::write_unaligned(p.add(16) as *mut u32, fb.width);
+                core::ptr::write_unaligned(p.add(20) as *mut u32, fb.height);
+                core::ptr::write_unaligned(p.add(24) as *mut u32, fb.stride);
+                core::ptr::write_unaligned(p.add(28) as *mut u32, fb.format);
             }
             0
         }

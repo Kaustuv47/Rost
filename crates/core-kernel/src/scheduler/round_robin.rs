@@ -124,6 +124,25 @@ impl Scheduler {
         )
     }
 
+    /// Register physical frames owned by a ring-3 process for reclaim on termination.
+    ///
+    /// Called by the ELF loader after `add_ring3_process` returns so that every
+    /// frame allocated for ELF segments, the user stack, and the PML4 is tracked
+    /// in the PCB and freed when the process terminates.
+    ///
+    /// Also sets `pml4_owned = true` so the PCB `Drop` knows to free
+    /// `page_table_base` as well.
+    ///
+    /// IEC 61508 §7.4.5: resources from terminated processes must be reclaimed.
+    pub fn register_user_frames(&self, pid: ProcessId, frames: &[u64]) {
+        if let Some(pcb) = self.process_table.borrow_mut().get_process(pid) {
+            for &frame in frames {
+                pcb.add_user_frame(frame);
+            }
+            pcb.pml4_owned = true;
+        }
+    }
+
     /// Set the priority of an already-registered process (0 = highest, 255 = lowest).
     pub fn set_priority(&self, pid: ProcessId, priority: u8) {
         if let Some(pcb) = self.process_table.borrow_mut().get_process(pid) {

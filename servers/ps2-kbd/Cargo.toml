@@ -1,0 +1,19 @@
+[package]
+name    = "rost-ps2-kbd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rost-ps2-kbd"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 2
+panic     = "abort"
+
+[profile.release]
+opt-level      = 3
+lto            = true
+codegen-units  = 1
+strip          = true
+panic          = "abort"

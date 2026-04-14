@@ -1,5 +1,9 @@
 [workspace]
-members = ["hello-world", "init", "net", "shell", "uart-drv", "vfs"]
+members = [
+    "hello-world", "init", "libc", "net",
+    "pci-bus", "block-drv", "gop", "ps2-kbd",
+    "shell", "uart-drv", "vfs",
+]
 resolver = "2"
 
 # Servers are standalone ring-3 ELF binaries.

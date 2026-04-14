@@ -108,6 +108,7 @@ extern "C" fn handle_divide_by_zero(frame: &ExceptionFrame) {
     if from_user(frame) {
         terminate_faulting_process(0xDE);
     }
+    core_kernel::framebuf::panic_screen(b"#DE  Division by Zero", frame.rip, frame.error_code, 0);
     hal::uart::print_str("System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }
@@ -133,6 +134,7 @@ extern "C" fn handle_general_protection(frame: &ExceptionFrame) {
         terminate_faulting_process(0x0D);
     }
     record_crash(frame, 0x0D, 0);
+    core_kernel::framebuf::panic_screen(b"#GP  General Protection Fault", frame.rip, frame.error_code, 0);
     hal::uart::print_str("System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }
@@ -157,6 +159,7 @@ extern "C" fn handle_page_fault(frame: &ExceptionFrame) {
         terminate_faulting_process(0x0E);
     }
     record_crash(frame, 0x0E, cr2);
+    core_kernel::framebuf::panic_screen(b"#PF  Page Fault", frame.rip, frame.error_code, cr2);
     hal::uart::print_str("System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }
@@ -168,6 +171,7 @@ extern "C" fn handle_double_fault(frame: &ExceptionFrame) {
     hal::uart::print_str("  FATAL: kernel exception handler faulted.\n");
     dump_registers(frame);
     record_crash(frame, 0x08, 0);
+    core_kernel::framebuf::panic_screen(b"#DF  Double Fault  (UNRECOVERABLE)", frame.rip, frame.error_code, 0);
     hal::uart::print_str("  System halted (unrecoverable).\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }

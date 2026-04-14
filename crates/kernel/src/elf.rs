@@ -75,12 +75,20 @@ struct Elf64Phdr {
 
 // ── Public result ─────────────────────────────────────────────────────────────
 
+/// Maximum physical frames tracked per ELF load (segments + PML4).
+/// Separate from the per-PCB cap — this is just the loader's local collection.
+const LOAD_FRAMES_MAX: usize = 64;
+
 /// Result of a successful ELF load.
 pub struct LoadedElf {
     /// Virtual entry point address.
     pub entry: u64,
     /// Physical address of the PML4 used for this process.
     pub pml4_phys: u64,
+    /// Physical frames allocated for this process (segment pages + PML4).
+    /// Passed to `Scheduler::register_user_frames` after the process is created.
+    pub frames: [u64; LOAD_FRAMES_MAX],
+    pub frame_count: usize,
 }
 
 // ── Loader ────────────────────────────────────────────────────────────────────
@@ -136,6 +144,19 @@ pub fn load(data: &[u8], pml4: Option<&mut PageTable>) -> Option<LoadedElf> {
 
     // ── 2. Obtain or create the target PML4 ───────────────────────────────────
 
+    let mut frames       = [0u64; LOAD_FRAMES_MAX];
+    let mut frame_count  = 0usize;
+
+    // Helper: record a frame for later reclaim (silently drops extras).
+    macro_rules! track {
+        ($phys:expr) => {{
+            if frame_count < LOAD_FRAMES_MAX {
+                frames[frame_count] = $phys;
+                frame_count += 1;
+            }
+        }};
+    }
+
     let (pml4_ref, pml4_phys) = match pml4 {
         Some(t) => {
             let phys = t as *mut PageTable as u64;
@@ -144,6 +165,8 @@ pub fn load(data: &[u8], pml4: Option<&mut PageTable>) -> Option<LoadedElf> {
         None => {
             let phys = global_alloc_4k()?;
             unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096); }
+            // Track the PML4 frame so spawn_elf can pass it to register_user_frames.
+            track!(phys);
             let r = unsafe { &mut *(phys as *mut PageTable) };
             (r, phys)
         }
@@ -186,6 +209,8 @@ pub fn load(data: &[u8], pml4: Option<&mut PageTable>) -> Option<LoadedElf> {
         for page_idx in 0..total_pages {
             let phys_page = global_alloc_4k()?;
             frame_tag(phys_page, FrameKind::UserOwned);
+            // Track every segment page for reclaim on process termination.
+            track!(phys_page);
             unsafe { core::ptr::write_bytes(phys_page as *mut u8, 0, 4096); }
 
             // Offset within seg_data that corresponds to the start of this page.
@@ -218,7 +243,7 @@ pub fn load(data: &[u8], pml4: Option<&mut PageTable>) -> Option<LoadedElf> {
         }
     }
 
-    Some(LoadedElf { entry: ehdr.e_entry, pml4_phys })
+    Some(LoadedElf { entry: ehdr.e_entry, pml4_phys, frames, frame_count })
 }
 
 // ── Convenience: spawn an ELF as a new ring-3 process ────────────────────────
@@ -305,7 +330,7 @@ pub fn spawn_elf(data: &[u8], priority: u8) -> Option<core_kernel::process::Proc
     hal::uart::print_str("      [DBG] elf size=");
     hal::uart::print_hex(data.len() as u64);
     hal::uart::print_str("\n");
-    let loaded = load(data, None)?;
+    let mut loaded = load(data, None)?;
     hal::uart::print_str("      [DBG] load ok, entry=");
     hal::uart::print_hex(loaded.entry);
     hal::uart::print_str("\n");
@@ -326,6 +351,11 @@ pub fn spawn_elf(data: &[u8], priority: u8) -> Option<core_kernel::process::Proc
     for page in 0..USER_STACK_PAGES {
         let phys = core_kernel::memory::global_alloc_4k()?;
         unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096); }
+        // Track stack frames for reclaim on process termination.
+        if loaded.frame_count < LOAD_FRAMES_MAX {
+            loaded.frames[loaded.frame_count] = phys;
+            loaded.frame_count += 1;
+        }
         let virt = stack_base_virt + (page * 4096) as u64;
         if !core_kernel::memory::map_page_global(pml4, virt, phys, stack_flags) {
             return None;
@@ -341,6 +371,10 @@ pub fn spawn_elf(data: &[u8], priority: u8) -> Option<core_kernel::process::Proc
     let pid = sched.add_ring3_process(loaded.entry, stack_top_virt, loaded.pml4_phys, trampoline)?;
     if priority > 0 { sched.set_priority(pid, priority); }
 
+    // Register all collected physical frames (ELF segments + stack + PML4) with
+    // the PCB so they are freed when the process terminates.
+    sched.register_user_frames(pid, &loaded.frames[..loaded.frame_count]);
+
     hal::uart::print_str("[ELF] entry=");
     hal::uart::print_hex(loaded.entry);
     hal::uart::print_str(" pml4=");
@@ -349,6 +383,8 @@ pub fn spawn_elf(data: &[u8], priority: u8) -> Option<core_kernel::process::Proc
     hal::uart::print_hex(stack_top_virt);
     hal::uart::print_str(" pid=");
     hal::uart::print_hex(pid.as_u32() as u64);
+    hal::uart::print_str(" frames=");
+    hal::uart::print_hex(loaded.frame_count as u64);
     hal::uart::print_str("\n");
     Some(pid)
 }
