@@ -1365,7 +1365,7 @@ extern "sysv64" fn dispatch_syscall(
         }
 
         // SYS_IRQ_REGISTER — register the calling process as the interrupt handler
-        // for a PCI hardware IRQ (GSI 8–15).
+        // for a hardware IRQ.
         //
         // The kernel will:
         //  1. Store caller PID → GSI mapping in irq_registry.
@@ -1374,14 +1374,16 @@ extern "sysv64" fn dispatch_syscall(
         //  4. On each IRQ, send an IPC message to the registered PID:
         //       msg.data[0] = 0xFFFF_0000 | gsi
         //
-        // a0 = GSI number (8–15 only; ISA IRQs 0–7 are reserved)
+        // a0 = GSI number; allowed: 1 (PS/2 kbd) and 8–15 (PCI slave range).
+        //      GSI 0 (system timer) and GSI 4 (UART COM1) are kernel-owned.
         // a1 = ISR status port (I/O port to `inb` in the ISR to de-assert the line;
-        //      pass 0 if the device does not require an ISR-port read, e.g. MSI-X)
+        //      pass 0 if the device does not require an ISR-port read)
         //
         // Returns 0 on success, EINVAL if GSI is out of range or IOAPIC unavailable.
         SYS_IRQ_REGISTER => {
             let gsi = a0 as u8;
-            if gsi < 8 || gsi > 15 { return EINVAL; }
+            let allowed = gsi == 1 || (gsi >= 8 && gsi <= 15);
+            if !allowed { return EINVAL; }
             let caller_pid = core_kernel::scheduler::CURRENT_PID.load(Ordering::Relaxed);
             let isr_port   = a1 as u16;
             if !core_kernel::irq_registry::register(gsi, caller_pid, isr_port) {

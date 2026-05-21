@@ -169,10 +169,8 @@ pub extern "C" fn _start() -> ! {
                 reply_err(msg.sender, op);
             }
         } else {
-            // Timeout — fallback poll in case an IRQ was missed
-            if let Some(ref mut vnet) = vnet_opt {
-                poll_rx(vnet);
-            }
+            // recv_msg timeout: only check deadlines below.
+            // All RX is interrupt-driven; no fallback poll.
         }
 
         // Advance the async ping state machine (check deadlines, send replies).

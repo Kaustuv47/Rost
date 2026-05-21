@@ -590,6 +590,18 @@ macro_rules! pci_irq_stub {
     };
 }
 
+// ── ISA IRQ handlers (GSI 1–7, vectors 33–39, master-PIC range) ──────────────
+//
+// Same structure as pci_irq_stub! but only the master PIC needs an EOI.
+// Sending an EOI to the slave PIC (0xA0) when the slave ISR is idle is a
+// harmless no-op, so we reuse pci_irq_stub! for consistency.
+//
+// Currently only GSI 1 (PS/2 keyboard, IDT vector 33) is registered by a
+// ring-3 server. The entry is wired in interrupts/mod.rs.
+
+pci_irq_stub!(isa_irq_gsi1, 1);
+
+// ── PCI IRQ handlers (GSI 8–15, vectors 40–47) ───────────────────────────────
 pci_irq_stub!(pci_irq_gsi8,  8);
 pci_irq_stub!(pci_irq_gsi9,  9);
 pci_irq_stub!(pci_irq_gsi10, 10);

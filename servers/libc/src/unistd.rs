@@ -44,8 +44,7 @@ pub extern "C" fn _exit(status: c_int) -> ! {
 
 /// Read up to `count` bytes into `buf`.
 ///
-/// * fd 0 (stdin): drains uart-drv keystrokes via SYS_RECV (10-tick timeout);
-///   returns once at least one byte is available.
+/// * fd 0 (stdin): blocks on SYS_RECV until uart-drv delivers a byte (interrupt-driven).
 /// * fd ≥ 3: forwards to VFS OP_READ_FD (reads one chunk at a time).
 ///
 /// Returns the number of bytes read, 0 for EOF, or -1 with errno set.
@@ -55,12 +54,10 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut u8, count: usize) -> ssize_t 
     let dst = core::slice::from_raw_parts_mut(buf, count);
 
     if fd == 0 {
-        // stdin: poll uart-drv with a short timeout, spin until a byte arrives.
-        loop {
-            let v = recv(10); // 100 ms
-            if v != u64::MAX { dst[0] = v as u8; return 1; }
-            crate::syscall::yield_();
-        }
+        // stdin: block until uart-drv delivers a byte via SYS_RECV.
+        let v = recv(u64::MAX);
+        if v != u64::MAX { dst[0] = v as u8; return 1; }
+        return 0;
     }
 
     let vfd = to_vfd(fd);

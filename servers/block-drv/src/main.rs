@@ -286,28 +286,16 @@ impl BlkDev {
         true
     }
 
-    /// Wait for the device to complete the current request.
-    /// Polls `used_hdr().idx` until it advances, then advances `used_last`.
-    unsafe fn wait_complete(&mut self) -> bool {
-        // Busy-wait with yield for up to ~500 ticks (5 seconds).
-        // In an interrupt-driven path the IRQ notification wakes us; we
-        // arrive here after recv_msg returns with an IRQ message.  For
-        // simplicity, also poll a fixed number of iterations.
-        for _ in 0..500_000usize {
-            fence(Ordering::SeqCst);
-            let used_idx = read_volatile(&(*used_hdr()).idx);
-            if used_idx != self.used_last {
-                self.used_last = used_idx;
-                let status = read_volatile(&(*addr_of!(BLK_STATUS)).0);
-                return status == 0; // 0 = VIRTIO_BLK_S_OK
-            }
-            // cooperative yield
-            unsafe { core::arch::asm!("syscall",
-                in("rax") 0u64,
-                lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-                options(nostack)); }
-        }
-        false // timeout
+    /// Check whether the device has completed the in-flight request.
+    /// Called from the IRQ notification handler after the kernel delivers the
+    /// interrupt IPC.  Returns true and advances `used_last` on completion.
+    unsafe fn check_complete(&mut self) -> bool {
+        fence(Ordering::SeqCst);
+        let used_idx = read_volatile(&(*used_hdr()).idx);
+        if used_idx == self.used_last { return false; } // spurious IRQ
+        self.used_last = used_idx;
+        let status = read_volatile(&(*addr_of!(BLK_STATUS)).0);
+        status == 0 // 0 = VIRTIO_BLK_S_OK
     }
 }
 
@@ -316,6 +304,17 @@ impl BlkDev {
 const OP_BLK_READ:   u64 = 0x50;
 const RESP_BLK_DATA: u64 = 0x90;
 const RESP_ERROR:    u64 = 0x8F;
+
+// ── Async I/O pending state ───────────────────────────────────────────────────
+//
+// block-drv serves one synchronous VFS request at a time (VFS uses SYS_CALL
+// which blocks until the reply arrives).  When a cache miss occurs we submit
+// the virtio-blk request and return immediately; the IRQ notification wakes us
+// to complete the I/O and send the reply.
+
+static mut PENDING_IO_SENDER: u64    = 0;   // 0 = no request in flight
+static mut PENDING_IO_LBA:    u32    = 0;
+static mut PENDING_IO_OFFSET: usize  = 0;
 
 // ── Sector cache (single-slot) ────────────────────────────────────────────────
 //
@@ -340,6 +339,26 @@ fn pack_bytes(src: &[u8], offset: usize, n: usize) -> [u64; 5] {
     words
 }
 
+/// Send a cached-sector chunk to `sender`.
+unsafe fn serve_from_cache(sender: u64, byte_offset: usize) {
+    let cb = &*addr_of!(CACHE_BUF);
+    let remaining = 512 - byte_offset;
+    let chunk_len = remaining.min(40);
+    let words = pack_bytes(cb, byte_offset, chunk_len);
+
+    let mut r = Msg::zeroed();
+    r.data[0] = RESP_BLK_DATA;
+    r.data[1] = 512;
+    r.data[2] = chunk_len as u64;
+    r.data[3..8].copy_from_slice(&words);
+    syscall::send_msg(sender, &r);
+}
+
+/// Handle an OP_BLK_READ message.
+///
+/// Cache hits are served immediately.  Cache misses submit the virtio-blk
+/// request and return; the reply is delivered asynchronously when the device
+/// IRQ fires and `handle_irq_completion` runs.
 unsafe fn handle_read(dev: &mut BlkDev, msg: &mut Msg) {
     let lba         = msg.data[1] as u32;
     let byte_offset = msg.data[2] as usize;
@@ -353,42 +372,69 @@ unsafe fn handle_read(dev: &mut BlkDev, msg: &mut Msg) {
         return;
     }
 
-    // Cache check
+    // Cache hit → reply immediately, no I/O needed.
     let cache_hit = {
         let cv = &*addr_of!(CACHE_VALID);
         let cl = &*addr_of!(CACHE_LBA);
         *cv && *cl == lba
     };
+    if cache_hit {
+        serve_from_cache(sender, byte_offset);
+        return;
+    }
 
-    if !cache_hit {
-        // Evict and fetch new sector.
-        if !dev.submit_read(lba as u64) || !dev.wait_complete() {
-            let mut r = Msg::zeroed();
-            r.data[0] = RESP_ERROR;
-            r.data[1] = 5; // EIO
-            syscall::send_msg(sender, &r);
-            return;
-        }
-        // Copy SECTOR_BUF → CACHE_BUF
+    // Guard: at most one in-flight request (VFS calls are synchronous via
+    // SYS_CALL so a second OP_BLK_READ cannot arrive while one is pending).
+    if *addr_of!(PENDING_IO_SENDER) != 0 {
+        let mut r = Msg::zeroed();
+        r.data[0] = RESP_ERROR;
+        r.data[1] = 16; // EBUSY
+        syscall::send_msg(sender, &r);
+        return;
+    }
+
+    // Submit async virtio-blk read; reply will arrive via IRQ notification.
+    if dev.submit_read(lba as u64) {
+        *addr_of_mut!(PENDING_IO_SENDER) = sender;
+        *addr_of_mut!(PENDING_IO_LBA)    = lba;
+        *addr_of_mut!(PENDING_IO_OFFSET) = byte_offset;
+    } else {
+        let mut r = Msg::zeroed();
+        r.data[0] = RESP_ERROR;
+        r.data[1] = 5; // EIO
+        syscall::send_msg(sender, &r);
+    }
+}
+
+/// Handle the virtio-blk IRQ notification.
+///
+/// Checks whether the pending request completed, updates the sector cache,
+/// and sends the reply to the waiting VFS caller.
+unsafe fn handle_irq_completion(dev: &mut BlkDev) {
+    let sender = *addr_of!(PENDING_IO_SENDER);
+    if sender == 0 { return; } // spurious IRQ or no pending request
+
+    if !dev.check_complete() { return; } // used ring not yet advanced
+
+    let lba    = *addr_of!(PENDING_IO_LBA);
+    let offset = *addr_of!(PENDING_IO_OFFSET);
+    *addr_of_mut!(PENDING_IO_SENDER) = 0;
+
+    let status = read_volatile(&(*addr_of!(BLK_STATUS)).0);
+    if status == 0 {
+        // Copy SECTOR_BUF → CACHE_BUF and serve.
         let sb = &*addr_of!(SECTOR_BUF);
         let cb = &mut *addr_of_mut!(CACHE_BUF);
         cb.copy_from_slice(&sb.0);
-        *addr_of_mut!(CACHE_LBA) = lba;
+        *addr_of_mut!(CACHE_LBA)   = lba;
         *addr_of_mut!(CACHE_VALID) = true;
+        serve_from_cache(sender, offset);
+    } else {
+        let mut r = Msg::zeroed();
+        r.data[0] = RESP_ERROR;
+        r.data[1] = 5; // EIO
+        syscall::send_msg(sender, &r);
     }
-
-    // Serve chunk from cache.
-    let cb = &*addr_of!(CACHE_BUF);
-    let remaining = 512 - byte_offset;
-    let chunk_len = remaining.min(40);
-    let words = pack_bytes(cb, byte_offset, chunk_len);
-
-    let mut r = Msg::zeroed();
-    r.data[0] = RESP_BLK_DATA;
-    r.data[1] = 512;
-    r.data[2] = chunk_len as u64;
-    r.data[3..8].copy_from_slice(&words);
-    syscall::send_msg(sender, &r);
 }
 
 // ── Device init ───────────────────────────────────────────────────────────────
@@ -429,22 +475,18 @@ unsafe fn init_device() -> Option<BlkDev> {
     // 6. DRIVER_OK
     io_write8(io_base, VIRTIO_REG_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
 
-    // 7. Register IRQ (PCI interrupt line, typically GSI 11 on QEMU q35).
+    // 7. Register IRQ — required for interrupt-driven completion (no polling fallback).
     let irq_line = pci_read8(bus, dev, func, 0x3C);
     let isr_port = io_base + VIRTIO_REG_ISR;
-    if irq_line >= 8 && irq_line <= 15 {
-        if irq_register(irq_line, isr_port) {
-            print(b"[block-drv] IRQ registered, GSI=");
-            print_dec(irq_line as u64);
-            print(b"\n");
-        } else {
-            print(b"[block-drv] IRQ register failed (continuing with polling)\n");
-        }
-    } else {
-        print(b"[block-drv] IRQ out of range (GSI=");
+    if !irq_register(irq_line, isr_port) {
+        print(b"[block-drv] ERROR: IRQ registration failed, GSI=");
         print_dec(irq_line as u64);
-        print(b"), polling fallback\n");
+        print(b" - device unavailable\n");
+        return None;
     }
+    print(b"[block-drv] IRQ registered, GSI=");
+    print_dec(irq_line as u64);
+    print(b"\n");
 
     print(b"[block-drv] ready, capacity=");
     print_dec(capacity);
@@ -491,15 +533,11 @@ pub extern "C" fn _start() -> ! {
             match buf.data[0] {
                 OP_BLK_READ => unsafe { handle_read(&mut dev, buf); },
 
-                // IRQ notification (data[0] == 0xFFFF_0000 | gsi)
-                v if v >> 16 == 0xFFFF => {
-                    // ACK: read ISR port (already done by kernel before delivering IPC).
-                    // Reclaim any completed descriptors; cache stays valid.
-                    fence(Ordering::SeqCst);
-                    // No explicit action needed — wait_complete will see used_idx advance.
-                }
+                // IRQ notification (data[0] == 0xFFFF_0000 | gsi):
+                // kernel has already read the ISR port; complete the pending I/O.
+                v if v >> 16 == 0xFFFF => unsafe { handle_irq_completion(&mut dev); },
 
-                _ => {} // ignore unknown
+                _ => {}
             }
         }
     }
