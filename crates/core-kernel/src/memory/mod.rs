@@ -5,6 +5,7 @@ pub mod pool;
 pub use paging::{
     map_page, map_page_global, translate_address, identity_map_region,
     split_huge_page_global, unmap_page, remap_page_flags,
+    merge_kernel_into_user_pml4, map_crash_log_page,
     PageTable,
     PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_NO_EXECUTE, PTE_ADDR_MASK,
 };

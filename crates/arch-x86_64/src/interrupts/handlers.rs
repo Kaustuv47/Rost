@@ -45,29 +45,29 @@ pub struct ExceptionFrame {
 // ── Serial register dump ──────────────────────────────────────────────────────
 
 fn dump_registers(f: &ExceptionFrame) {
-    hal::uart::print_str("  rax="); hal::uart::print_hex(f.rax);
-    hal::uart::print_str("  rbx="); hal::uart::print_hex(f.rbx);
-    hal::uart::print_str("  rcx="); hal::uart::print_hex(f.rcx);
-    hal::uart::print_str("  rdx="); hal::uart::print_hex(f.rdx);
-    hal::uart::print_str("\n");
-    hal::uart::print_str("  rsi="); hal::uart::print_hex(f.rsi);
-    hal::uart::print_str("  rdi="); hal::uart::print_hex(f.rdi);
-    hal::uart::print_str("  rbp="); hal::uart::print_hex(f.rbp);
-    hal::uart::print_str("\n");
-    hal::uart::print_str("  r8 ="); hal::uart::print_hex(f.r8);
-    hal::uart::print_str("  r9 ="); hal::uart::print_hex(f.r9);
-    hal::uart::print_str("  r10="); hal::uart::print_hex(f.r10);
-    hal::uart::print_str("  r11="); hal::uart::print_hex(f.r11);
-    hal::uart::print_str("\n");
-    hal::uart::print_str("  r12="); hal::uart::print_hex(f.r12);
-    hal::uart::print_str("  r13="); hal::uart::print_hex(f.r13);
-    hal::uart::print_str("  r14="); hal::uart::print_hex(f.r14);
-    hal::uart::print_str("  r15="); hal::uart::print_hex(f.r15);
-    hal::uart::print_str("\n");
-    hal::uart::print_str("  rip="); hal::uart::print_hex(f.rip);
-    hal::uart::print_str("  rfl="); hal::uart::print_hex(f.rflags);
-    hal::uart::print_str("  err="); hal::uart::print_hex(f.error_code);
-    hal::uart::print_str("\n");
+    hal::uart::print_str_direct("  rax="); hal::uart::print_hex_direct(f.rax);
+    hal::uart::print_str_direct("  rbx="); hal::uart::print_hex_direct(f.rbx);
+    hal::uart::print_str_direct("  rcx="); hal::uart::print_hex_direct(f.rcx);
+    hal::uart::print_str_direct("  rdx="); hal::uart::print_hex_direct(f.rdx);
+    hal::uart::print_str_direct("\n");
+    hal::uart::print_str_direct("  rsi="); hal::uart::print_hex_direct(f.rsi);
+    hal::uart::print_str_direct("  rdi="); hal::uart::print_hex_direct(f.rdi);
+    hal::uart::print_str_direct("  rbp="); hal::uart::print_hex_direct(f.rbp);
+    hal::uart::print_str_direct("\n");
+    hal::uart::print_str_direct("  r8 ="); hal::uart::print_hex_direct(f.r8);
+    hal::uart::print_str_direct("  r9 ="); hal::uart::print_hex_direct(f.r9);
+    hal::uart::print_str_direct("  r10="); hal::uart::print_hex_direct(f.r10);
+    hal::uart::print_str_direct("  r11="); hal::uart::print_hex_direct(f.r11);
+    hal::uart::print_str_direct("\n");
+    hal::uart::print_str_direct("  r12="); hal::uart::print_hex_direct(f.r12);
+    hal::uart::print_str_direct("  r13="); hal::uart::print_hex_direct(f.r13);
+    hal::uart::print_str_direct("  r14="); hal::uart::print_hex_direct(f.r14);
+    hal::uart::print_str_direct("  r15="); hal::uart::print_hex_direct(f.r15);
+    hal::uart::print_str_direct("\n");
+    hal::uart::print_str_direct("  rip="); hal::uart::print_hex_direct(f.rip);
+    hal::uart::print_str_direct("  rfl="); hal::uart::print_hex_direct(f.rflags);
+    hal::uart::print_str_direct("  err="); hal::uart::print_hex_direct(f.error_code);
+    hal::uart::print_str_direct("\n");
 }
 
 // ── Helper: is the frame from ring-3? ────────────────────────────────────────
@@ -102,77 +102,77 @@ fn record_crash(frame: &ExceptionFrame, vector: u64, cr2: u64) {
 
 #[cold]
 extern "C" fn handle_divide_by_zero(frame: &ExceptionFrame) {
-    hal::uart::print_str("\n[EXCEPTION #DE — Division by Zero]\n");
-    hal::uart::print_str(if from_user(frame) { "  origin: user-mode\n" } else { "  origin: kernel\n" });
+    hal::uart::print_str_direct("\n[EXCEPTION #DE — Division by Zero]\n");
+    hal::uart::print_str_direct(if from_user(frame) { "  origin: user-mode\n" } else { "  origin: kernel\n" });
     dump_registers(frame);
     if from_user(frame) {
         terminate_faulting_process(0xDE);
     }
     core_kernel::framebuf::panic_screen(b"#DE  Division by Zero", frame.rip, frame.error_code, 0);
-    hal::uart::print_str("System halted.\n");
+    hal::uart::print_str_direct("System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }
 
 #[cold]
 extern "C" fn handle_general_protection(frame: &ExceptionFrame) {
-    hal::uart::print_str("\n[EXCEPTION #GP — General Protection Fault]\n");
-    hal::uart::print_str("  frame@");
-    hal::uart::print_hex(frame as *const ExceptionFrame as u64);
-    hal::uart::print_str("\n");
-    hal::uart::print_str("  err=");
-    hal::uart::print_hex(frame.error_code);
-    hal::uart::print_str("\n");
-    hal::uart::print_str("  rip=");
-    hal::uart::print_hex(frame.rip);
-    hal::uart::print_str("\n");
-    hal::uart::print_str("  cs=");
-    hal::uart::print_hex(frame.cs);
-    hal::uart::print_str("\n");
-    hal::uart::print_str(if from_user(frame) { "  origin: user-mode\n" } else { "  origin: kernel\n" });
+    hal::uart::print_str_direct("\n[EXCEPTION #GP — General Protection Fault]\n");
+    hal::uart::print_str_direct("  frame@");
+    hal::uart::print_hex_direct(frame as *const ExceptionFrame as u64);
+    hal::uart::print_str_direct("\n");
+    hal::uart::print_str_direct("  err=");
+    hal::uart::print_hex_direct(frame.error_code);
+    hal::uart::print_str_direct("\n");
+    hal::uart::print_str_direct("  rip=");
+    hal::uart::print_hex_direct(frame.rip);
+    hal::uart::print_str_direct("\n");
+    hal::uart::print_str_direct("  cs=");
+    hal::uart::print_hex_direct(frame.cs);
+    hal::uart::print_str_direct("\n");
+    hal::uart::print_str_direct(if from_user(frame) { "  origin: user-mode\n" } else { "  origin: kernel\n" });
     dump_registers(frame);
     if from_user(frame) {
         terminate_faulting_process(0x0D);
     }
     record_crash(frame, 0x0D, 0);
     core_kernel::framebuf::panic_screen(b"#GP  General Protection Fault", frame.rip, frame.error_code, 0);
-    hal::uart::print_str("System halted.\n");
+    hal::uart::print_str_direct("System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }
 
 #[cold]
 extern "C" fn handle_page_fault(frame: &ExceptionFrame) {
     let cr2 = crate::cpu::read_cr2();
-    hal::uart::print_str("\n[EXCEPTION #PF — Page Fault]\n");
-    hal::uart::print_str("  frame@");
-    hal::uart::print_hex(frame as *const ExceptionFrame as u64);
-    hal::uart::print_str("\n");
-    hal::uart::print_str("  fault addr="); hal::uart::print_hex(cr2);
-    hal::uart::print_str("\n");
-    hal::uart::print_str("  err=");  hal::uart::print_hex(frame.error_code);
-    hal::uart::print_str("  rip=");  hal::uart::print_hex(frame.rip);
-    hal::uart::print_str("  cs=");   hal::uart::print_hex(frame.cs);
-    hal::uart::print_str("  rfl=");  hal::uart::print_hex(frame.rflags);
-    hal::uart::print_str("\n");
-    hal::uart::print_str(if from_user(frame) { "  origin: user-mode\n" } else { "  origin: kernel\n" });
+    hal::uart::print_str_direct("\n[EXCEPTION #PF — Page Fault]\n");
+    hal::uart::print_str_direct("  frame@");
+    hal::uart::print_hex_direct(frame as *const ExceptionFrame as u64);
+    hal::uart::print_str_direct("\n");
+    hal::uart::print_str_direct("  fault addr="); hal::uart::print_hex_direct(cr2);
+    hal::uart::print_str_direct("\n");
+    hal::uart::print_str_direct("  err=");  hal::uart::print_hex_direct(frame.error_code);
+    hal::uart::print_str_direct("  rip=");  hal::uart::print_hex_direct(frame.rip);
+    hal::uart::print_str_direct("  cs=");   hal::uart::print_hex_direct(frame.cs);
+    hal::uart::print_str_direct("  rfl=");  hal::uart::print_hex_direct(frame.rflags);
+    hal::uart::print_str_direct("\n");
+    hal::uart::print_str_direct(if from_user(frame) { "  origin: user-mode\n" } else { "  origin: kernel\n" });
     dump_registers(frame);
     if from_user(frame) {
         terminate_faulting_process(0x0E);
     }
     record_crash(frame, 0x0E, cr2);
     core_kernel::framebuf::panic_screen(b"#PF  Page Fault", frame.rip, frame.error_code, cr2);
-    hal::uart::print_str("System halted.\n");
+    hal::uart::print_str_direct("System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }
 
 #[cold]
 extern "C" fn handle_double_fault(frame: &ExceptionFrame) {
     // #DF uses IST1 — always runs on a fresh stack regardless of caller state.
-    hal::uart::print_str("\n[EXCEPTION #DF — Double Fault]\n");
-    hal::uart::print_str("  FATAL: kernel exception handler faulted.\n");
+    hal::uart::print_str_direct("\n[EXCEPTION #DF — Double Fault]\n");
+    hal::uart::print_str_direct("  FATAL: kernel exception handler faulted.\n");
     dump_registers(frame);
     record_crash(frame, 0x08, 0);
     core_kernel::framebuf::panic_screen(b"#DF  Double Fault  (UNRECOVERABLE)", frame.rip, frame.error_code, 0);
-    hal::uart::print_str("  System halted (unrecoverable).\n");
+    hal::uart::print_str_direct("  System halted (unrecoverable).\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }
 
@@ -180,18 +180,18 @@ extern "C" fn handle_double_fault(frame: &ExceptionFrame) {
 extern "C" fn handle_nmi() {
     // NMI cannot be masked and must complete quickly.
     // In a real system: check ECC status, hardware watchdog, then IRET.
-    hal::uart::print_str("\n[NMI — Non-Maskable Interrupt]\n");
-    hal::uart::print_str("  (hardware watchdog / ECC signal — logged)\n");
+    hal::uart::print_str_direct("\n[NMI — Non-Maskable Interrupt]\n");
+    hal::uart::print_str_direct("  (hardware watchdog / ECC signal — logged)\n");
     // Do NOT halt: NMI is typically recoverable (corrected ECC, watchdog ping).
 }
 
 #[cold]
 extern "C" fn handle_machine_check(frame: &ExceptionFrame) {
-    hal::uart::print_str("\n[EXCEPTION #MC — Machine Check]\n");
-    hal::uart::print_str("  FATAL: uncorrectable hardware error.\n");
+    hal::uart::print_str_direct("\n[EXCEPTION #MC — Machine Check]\n");
+    hal::uart::print_str_direct("  FATAL: uncorrectable hardware error.\n");
     dump_registers(frame);
     record_crash(frame, 0x12, 0);
-    hal::uart::print_str("  System halted.\n");
+    hal::uart::print_str_direct("  System halted.\n");
     loop { unsafe { core::arch::asm!("cli", "hlt", options(nostack, nomem)); } }
 }
 
@@ -225,9 +225,9 @@ fn terminate_faulting_process(fault_code: u64) -> ! {
     use core_kernel::scheduler::{get_global, CURRENT_PID};
 
     let pid_raw = CURRENT_PID.load(Ordering::Relaxed);
-    hal::uart::print_str("  → terminating ring-3 process PID=");
-    hal::uart::print_hex(pid_raw as u64);
-    hal::uart::print_str(", notifying init\n");
+    hal::uart::print_str_direct("  → terminating ring-3 process PID=");
+    hal::uart::print_hex_direct(pid_raw as u64);
+    hal::uart::print_str_direct(", notifying init\n");
 
     if let Some(sched) = get_global() {
         let pid  = core_kernel::process::ProcessId::new(pid_raw);
@@ -275,9 +275,9 @@ fn terminate_faulting_process(fault_code: u64) -> ! {
 /// Catch-all for any unexpected interrupt/exception vector.
 #[cold]
 extern "C" fn handle_unexpected(vector: u64, frame: &ExceptionFrame) {
-    hal::uart::print_str("\n[UNEXPECTED INTERRUPT vector=0x");
-    hal::uart::print_hex(vector);
-    hal::uart::print_str("]\n");
+    hal::uart::print_str_direct("\n[UNEXPECTED INTERRUPT vector=0x");
+    hal::uart::print_hex_direct(vector);
+    hal::uart::print_str_direct("]\n");
     dump_registers(frame);
     // Do not halt — unhandled IRQs should be EOI'd and ignored.
     // For now send EOI to both PIC masters so we don't dead-lock.
@@ -352,11 +352,11 @@ macro_rules! exception_stub_with_code {
     };
 }
 
-exception_stub_no_code!(divide_by_zero_handler,        handle_divide_by_zero);
-exception_stub_with_code!(general_protection_fault_handler, handle_general_protection);
-exception_stub_with_code!(page_fault_handler,          handle_page_fault);
+exception_stub_no_code!(divide_by_zero_handler,              handle_divide_by_zero);
+exception_stub_with_code!(general_protection_fault_handler,  handle_general_protection);
+exception_stub_with_code!(page_fault_handler,                handle_page_fault);
 // #DF has an error code (always 0) and uses IST1.
-exception_stub_with_code!(double_fault_handler,        handle_double_fault);
+exception_stub_with_code!(double_fault_handler,              handle_double_fault);
 
 // NMI (no error code, uses IST2).
 #[unsafe(naked)]

@@ -62,6 +62,34 @@ pub fn init() {
     }
 }
 
+/// Write one byte directly to COM1, spinning until THRE is set.
+///
+/// Bypasses the TX ring buffer entirely.  Use for crash-path and
+/// diagnostic output where interrupts may be disabled or the ring
+/// is already full.  Does NOT arm ETBEI — no side effects on the
+/// interrupt-driven path.
+pub fn put_byte_direct(byte: u8) {
+    unsafe {
+        while inb(COM1 + OFF_LSR) & LSR_THRE == 0 {}
+        outb(COM1 + OFF_THR, byte);
+    }
+}
+
+/// Same as `put_byte_direct` but for a string.
+pub fn print_str_direct(s: &str) {
+    for b in s.bytes() { put_byte_direct(b); }
+}
+
+/// Same as `print_hex` but direct-poll (no ring buffer).
+pub fn print_hex_direct(val: u64) {
+    print_str_direct("0x");
+    let hex_chars = b"0123456789ABCDEF";
+    for i in (0..16).rev() {
+        let digit = ((val >> (i * 4)) & 0xF) as usize;
+        put_byte_direct(hex_chars[digit]);
+    }
+}
+
 /// Enqueue `byte` for transmission via the interrupt-driven TX path.
 ///
 /// The function **never spins**.  It pushes the byte into the ring buffer and

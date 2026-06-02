@@ -53,6 +53,11 @@
 /// | 26 | sys_spawn_elf       | Load ring-3 ELF image from user buffer and spawn a new process |
 /// | 27 | sys_restart_server  | Restart a named server using the kernel's embedded ELF image |
 /// | 28 | sys_list_procs      | Snapshot process table into user buffer (24 bytes/entry) |
+/// | 34 | sys_alloc_phys      | Allocate a zeroed 4 KB physical frame; return paddr (0=OOM) |
+/// | 35 | sys_create_vas      | Allocate a PML4, merge kernel entries; return pml4_paddr |
+/// | 36 | sys_map_into_vas    | Map paddr at vaddr in an arbitrary PML4 (exec server use) |
+/// | 37 | sys_spawn_with_vas  | Create ring-3 process from pre-built PML4 + alloc stack |
+/// | 38 | sys_register_frames | Append ELF segment frames to a PID's PCB for reclaim |
 use super::{rdmsr, wrmsr};
 
 // MSR addresses
@@ -97,6 +102,11 @@ const SYS_IOPORT_IN:       u64 = 30; // proxy port I/O read  for ring-3 drivers 
 const SYS_PHYS_ADDR:       u64 = 31; // translate virtual → physical address (for DMA setup)
 const SYS_IRQ_REGISTER:    u64 = 32; // register PCI IRQ handler: a0=GSI, a1=ISR port
 const SYS_GET_FRAMEBUF:    u64 = 33; // get primary GOP framebuffer info → user struct (a0=ptr)
+const SYS_ALLOC_PHYS:      u64 = 34; // allocate 4 KB physical frame, zero it, return paddr (0=OOM)
+const SYS_CREATE_VAS:      u64 = 35; // alloc PML4, merge kernel pages, return pml4_paddr (0=OOM)
+const SYS_MAP_INTO_VAS:    u64 = 36; // map paddr at vaddr in given PML4 (a0=pml4, a1=vaddr, a2=paddr, a3=flags)
+const SYS_SPAWN_WITH_VAS:  u64 = 37; // create ring-3 process from pre-built PML4 (a0=pml4, a1=entry, a2=priority)
+const SYS_REGISTER_FRAMES: u64 = 38; // register ELF segment frames with a PID's PCB (a0=pid, a1=ptr, a2=count)
 
 // Error codes
 const ENOSYS:    u64 = u64::MAX;      // -1: function not implemented
@@ -415,6 +425,15 @@ extern "sysv64" fn dispatch_syscall(
                 match sched.blocking_receive(pid, a0) {
                     Some(msg) => return msg.get_data(0),
                     None => {
+                        // timeout=0 is a non-blocking poll: blocking_receive already
+                        // returned None without marking us Blocked.  Return u64::MAX
+                        // immediately — do NOT call prepare_block_switch or arm_oneshot.
+                        // Calling arm_oneshot here would reset the LAPIC one-shot
+                        // countdown on every rapid poll iteration, preventing the timer
+                        // ISR from ever firing and killing preemption entirely.
+                        if a0 == 0 {
+                            return u64::MAX;
+                        }
                         // True blocking: context-switch to the next ready process.
                         if let Some((old, new, pml4, kern_rsp)) =
                             sched.prepare_block_switch(pid)
@@ -678,7 +697,7 @@ extern "sysv64" fn dispatch_syscall(
         // Ring-3 processes have no IOPL, so all port I/O must go through here.
         // Returns 0.
         SYS_UART_WRITE => {
-            hal::uart::put_byte(a0 as u8);
+            hal::uart::put_byte_direct(a0 as u8);
             0
         }
 
@@ -819,7 +838,31 @@ extern "sysv64" fn dispatch_syscall(
                     unsafe { core::ptr::write(a2 as *mut core_kernel::ipc::Message, reply); }
                     0
                 }
-                None => ETIMEDOUT,
+                None => {
+                    // True blocking: context-switch to let the target run and reply.
+                    if let Some((old, new, pml4, kern_rsp)) =
+                        sched.prepare_block_switch(caller)
+                    {
+                        if let Some(next_pid) = sched.current_process() {
+                            core_kernel::scheduler::CURRENT_PID
+                                .store(next_pid.as_u32(), Ordering::Relaxed);
+                        }
+                        crate::apic::lapic::arm_oneshot(1);
+                        unsafe {
+                            super::tss::set_rsp0(kern_rsp);
+                            // Execution resumes here when this process is rescheduled.
+                            crate::context::switch_context_noints(old, new, pml4);
+                        }
+                    }
+                    // Post-resume: non-blocking poll — reply arrived or genuine timeout.
+                    match sched.blocking_receive(caller, 0) {
+                        Some(reply) => {
+                            unsafe { core::ptr::write(a2 as *mut core_kernel::ipc::Message, reply); }
+                            0
+                        }
+                        None => ETIMEDOUT,
+                    }
+                }
             }
         }
 
@@ -1428,6 +1471,155 @@ extern "sysv64" fn dispatch_syscall(
                 core::ptr::write_unaligned(p.add(24) as *mut u32, fb.stride);
                 core::ptr::write_unaligned(p.add(28) as *mut u32, fb.format);
             }
+            0
+        }
+
+        // SYS_ALLOC_PHYS — allocate one zeroed 4 KB physical frame.
+        //
+        // Returns the physical address on success, 0 on OOM.
+        // Physical address 0 is never a valid allocation (kernel lives above 1 MB).
+        //
+        // Used by ring-3 exec servers to allocate frames for ELF segment pages
+        // before mapping them into a new address space via SYS_MAP_INTO_VAS.
+        SYS_ALLOC_PHYS => {
+            match core_kernel::memory::global_alloc_4k() {
+                Some(paddr) => {
+                    unsafe { core::ptr::write_bytes(paddr as *mut u8, 0, 4096); }
+                    paddr
+                }
+                None => 0,
+            }
+        }
+
+        // SYS_CREATE_VAS — allocate a new PML4 and merge kernel page-table entries.
+        //
+        // Returns pml4_paddr on success, 0 on OOM.
+        //
+        // The returned PML4 has the same kernel-side entries as the current kernel
+        // PML4 so that SYSCALL handlers work correctly when CR3 = new PML4.
+        // Equivalent to the kernel's internal `merge_kernel_into_user_pml4`.
+        SYS_CREATE_VAS => {
+            let pml4_paddr = match core_kernel::memory::global_alloc_4k() {
+                Some(p) => p,
+                None    => return ENOMEM,
+            };
+            unsafe { core::ptr::write_bytes(pml4_paddr as *mut u8, 0, 4096); }
+            unsafe { core_kernel::memory::merge_kernel_into_user_pml4(pml4_paddr); }
+            let pml4 = unsafe { &mut *(pml4_paddr as *mut core_kernel::memory::PageTable) };
+            core_kernel::memory::map_crash_log_page(pml4);
+            pml4_paddr
+        }
+
+        // SYS_MAP_INTO_VAS — map a physical frame into an arbitrary PML4.
+        //
+        // a0 = pml4_paddr   — physical address of the target PML4
+        // a1 = vaddr        — virtual address in the target address space
+        // a2 = paddr        — physical frame to map (must be 4 KB-aligned)
+        // a3 = flags        — bit 0=WRITABLE, bit 1=USER, bit 2=NO_EXECUTE
+        //
+        // Returns 0 on success, EINVAL for bad arguments, ENOMEM on OOM
+        // (page-table level allocation failure).
+        SYS_MAP_INTO_VAS => {
+            if a0 == 0 || a2 == 0 { return EINVAL; }
+            if a2 & 0xFFF != 0 { return EINVAL; }
+
+            let pml4 = unsafe { &mut *(a0 as *mut core_kernel::memory::PageTable) };
+            let mut flags = core_kernel::memory::PTE_PRESENT;
+            if a3 & 1 != 0 { flags |= core_kernel::memory::PTE_WRITABLE; }
+            if a3 & 2 != 0 { flags |= core_kernel::memory::PTE_USER; }
+            if a3 & 4 != 0 { flags |= core_kernel::memory::PTE_NO_EXECUTE; }
+
+            if core_kernel::memory::map_page_global(pml4, a1, a2, flags) { 0 } else { ENOMEM }
+        }
+
+        // SYS_SPAWN_WITH_VAS — create a ring-3 process from a pre-built PML4.
+        //
+        // a0 = pml4_paddr  — physical address of the pre-built PML4
+        // a1 = entry_va    — virtual entry point of the new process
+        // a2 = priority    — scheduling priority (0 = default 128)
+        //
+        // Allocates and maps a 128 KB user stack at the canonical top address
+        // (0x0000_7FFF_FFFF_F000 downward) into the given PML4.
+        // Creates a ring-3 PCB and adds it to the scheduler.
+        // Registers the stack frames + PML4 ownership with the new PCB so they
+        // are freed on process termination.
+        //
+        // Returns new PID on success, EINVAL if pml4/entry is 0 or the process
+        // table is full, ENOMEM on physical memory exhaustion, ENOSYS if no
+        // scheduler is active.
+        SYS_SPAWN_WITH_VAS => {
+            if a0 == 0 || a1 == 0 { return EINVAL; }
+            let sched = match core_kernel::scheduler::get_global() {
+                Some(s) => s,
+                None    => return ENOSYS,
+            };
+
+            const STACK_TOP:   u64   = 0x0000_7FFF_FFFF_F000;
+            const STACK_PAGES: usize = 32; // 128 KB
+
+            let pml4 = unsafe { &mut *(a0 as *mut core_kernel::memory::PageTable) };
+            let stack_flags = core_kernel::memory::PTE_PRESENT
+                | core_kernel::memory::PTE_WRITABLE
+                | core_kernel::memory::PTE_USER
+                | core_kernel::memory::PTE_NO_EXECUTE;
+
+            let mut stack_frames = [0u64; STACK_PAGES];
+            for i in 0..STACK_PAGES {
+                let phys = match core_kernel::memory::global_alloc_4k() {
+                    Some(p) => p,
+                    None    => return ENOMEM,
+                };
+                unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096); }
+                stack_frames[i] = phys;
+                let virt = STACK_TOP - ((STACK_PAGES - i) as u64 * 4096);
+                if !core_kernel::memory::map_page_global(pml4, virt, phys, stack_flags) {
+                    return ENOMEM;
+                }
+            }
+
+            let trampoline = crate::context::ring3_entry_trampoline as *const () as u64;
+            let pid = match sched.add_ring3_process(a1, STACK_TOP, a0, trampoline) {
+                Some(p) => p,
+                None    => return EINVAL,
+            };
+            let priority = if a2 == 0 { 128u8 } else { (a2 & 0xFF) as u8 };
+            sched.set_priority(pid, priority);
+
+            // register_user_frames sets pml4_owned=true so the PML4 (a0) is freed
+            // via page_table_base on process exit; stack frames go into user_frames.
+            sched.register_user_frames(pid, &stack_frames);
+
+            pid.as_u32() as u64
+        }
+
+        // SYS_REGISTER_FRAMES — append physical frames to a PID's user-frame list.
+        //
+        // a0 = pid     — target process (must already exist)
+        // a1 = ptr     — pointer to u64 array of physical addresses (user space)
+        // a2 = count   — number of entries (capped at 128)
+        //
+        // Used by the ring-3 exec server to register ELF segment pages with the
+        // new process's PCB so they are freed when the process terminates.
+        // Unlike register_user_frames this does NOT set pml4_owned.
+        //
+        // Returns 0 on success, EINVAL for bad arguments, ENOSYS if no scheduler.
+        SYS_REGISTER_FRAMES => {
+            const MAX_FRAMES: usize = 128;
+            let count = (a2 as usize).min(MAX_FRAMES);
+            if a1 == 0 || count == 0 { return EINVAL; }
+            if !validate_user_ptr(a1, count * 8, 8) { return EINVAL; }
+
+            let sched = match core_kernel::scheduler::get_global() {
+                Some(s) => s,
+                None    => return ENOSYS,
+            };
+            let pid = core_kernel::process::ProcessId::new(a0 as u32);
+
+            let frames_ptr = a1 as *const u64;
+            let mut frames = [0u64; MAX_FRAMES];
+            unsafe { core::ptr::copy_nonoverlapping(frames_ptr, frames.as_mut_ptr(), count); }
+
+            sched.append_user_frames(pid, &frames[..count]);
             0
         }
 

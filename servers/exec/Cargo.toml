@@ -1,0 +1,10 @@
+[package]
+name    = "rost-exec"
+version = "0.1.0"
+edition = "2021"
+
+# No kernel crate dependencies — interface is purely syscall-based.
+
+[[bin]]
+name = "rost-exec"
+path = "src/main.rs"

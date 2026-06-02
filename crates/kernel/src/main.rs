@@ -51,6 +51,9 @@ static GOP_ELF: &[u8] = include_bytes!(
 static PS2_KBD_ELF: &[u8] = include_bytes!(
     "../../../servers/target/x86_64-unknown-none/debug/rost-ps2-kbd"
 );
+static EXEC_ELF: &[u8] = include_bytes!(
+    "../../../servers/target/x86_64-unknown-none/debug/rost-exec"
+);
 
 use arch_x86_64::cpu::{GlobalDescriptorTable, InterruptDescriptorTable};
 use core_kernel::boot_info::BootInfo;
@@ -989,6 +992,15 @@ fn efi_main(image_handle: Handle, system_table: SystemTable<Boot>) -> Status {
     let ps2_kbd_pid = elf::spawn_elf(PS2_KBD_ELF, 80);
     if ps2_kbd_pid.is_none() {
         hal::uart::print_str("      [WARN] rost-ps2-kbd ELF load failed\n");
+    }
+
+    // Spawn the ring-3 exec server.  Once running it registers as "exec" and
+    // handles all runtime SYS_SPAWN_ELF requests from user processes.
+    // The kernel's elf.rs is still used above for boot-time spawning only.
+    hal::uart::print_str("      └─ Spawning rost-exec (ring-3 ELF loader)...\n");
+    let exec_pid = elf::spawn_elf(EXEC_ELF, 60); // priority 60: between uart-drv(64) and init(32)
+    if exec_pid.is_none() {
+        hal::uart::print_str("      [WARN] rost-exec ELF load failed\n");
     }
 
     // Set TSS.RSP0, CURRENT_PID, and the scheduler's internal current_process

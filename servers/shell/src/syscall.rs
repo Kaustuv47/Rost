@@ -364,6 +364,27 @@ pub fn uart_write(byte: u8) {
     }
 }
 
+/// Translate a virtual address in the calling process's address space to
+/// its physical address.  Used to pass ELF buffer locations to the exec server.
+///
+/// Returns `Some(phys)` on success, `None` if the address is unmapped.
+#[inline]
+pub fn phys_addr(virt: u64) -> Option<u64> {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax")      31u64,
+            in("rdi")      virt,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    if ret >= u64::MAX - 7 { None } else { Some(ret) }
+}
+
 /// Load and spawn a ring-3 ELF process from `elf_buf`.
 ///
 /// The kernel reads the ELF bytes from `elf_buf`, maps all PT_LOAD segments

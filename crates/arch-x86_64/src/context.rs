@@ -112,8 +112,8 @@ pub unsafe extern "C" fn switch_context(
 /// executes `ret` for the first time on such a PCB, execution arrives here.
 ///
 /// On entry (from `switch_context`):
-///   r12 = user virtual entry point (set in TaskContext by `ProcessControlBlock::new_ring3`)
-///   r13 = user virtual stack top   (set in TaskContext by `ProcessControlBlock::new_ring3`)
+///   r12 = user virtual entry point (set in TaskContext by `ProcessControlBlock::new_ring3_into`)
+///   r13 = user virtual stack top   (set in TaskContext by `ProcessControlBlock::new_ring3_into`)
 ///
 /// The function builds a five-word IRETQ frame on the kernel stack and executes
 /// `iretq`, which atomically:
@@ -130,7 +130,7 @@ pub unsafe extern "C" fn switch_context(
 #[unsafe(naked)]
 pub unsafe extern "C" fn ring3_entry_trampoline() {
     core::arch::naked_asm!(
-        // r12 = user RIP,  r13 = user RSP  (set by ProcessControlBlock::new_ring3)
+        // r12 = user RIP,  r13 = user RSP  (set by ProcessControlBlock::new_ring3_into)
         // RSP = kern_stack_top - 8 when we arrive here via `ret`.
         "push 0x1B",                          // SS  = ring-3 data (0x18 | 3)
         "push r13",                           // RSP = user stack top

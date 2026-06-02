@@ -155,3 +155,19 @@ pub fn send_msg(to_pid: u64, msg: &Msg) -> bool {
     }
     ret == 0
 }
+
+/// Write one byte directly to COM1 (SYS_UART_WRITE = 12).  For diagnostics only.
+#[inline]
+pub fn uart_write(byte: u8) {
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax")  12u64,
+            in("rdi")  byte as u64,
+            lateout("rax") _,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+}

@@ -1,4 +1,7 @@
 /target
 /build
-/servers/targetservers/hello-c/hello-c
+/servers/target
+servers/hello-c/hello-c
 servers/hello-c/hello.o
+# Added by code-review-graph
+.code-review-graph/

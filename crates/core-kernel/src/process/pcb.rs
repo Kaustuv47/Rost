@@ -2,22 +2,22 @@ use super::ProcessId;
 
 /// Per-process kernel stack — one slot per process, lives in BSS.
 ///
-/// # Layout per slot  (12 KB each)
+/// # Layout per slot  (36 KB each)
 /// ```text
 /// offset 0    ┌──────────────────┐ ← guard page (4 KB, unmapped at boot)
 ///             │  GUARD (4 KB)    │   stack overflow → #PF here instead of
 ///             │  (never touched) │   silently corrupting the next slot
 /// offset 4096 ├──────────────────┤ ← stack bottom  (guard_addr + 4096)
-///             │  STACK (8 KB)    │   grows downward
+///             │  STACK (32 KB)   │   grows downward
 ///             │                  │
-/// offset 12288└──────────────────┘ ← stack top  (guard_addr + KERNEL_SLOT_SIZE)
+/// offset 36864└──────────────────┘ ← stack top  (guard_addr + KERNEL_SLOT_SIZE)
 /// ```
 ///
 /// `alloc_kernel_stack()` returns the guard-page address alongside the
 /// stack-top so callers can install the guard mapping.
-pub const KERNEL_STACK_SIZE: usize = 8192;
+pub const KERNEL_STACK_SIZE: usize = 32768; // 32 KB
 pub const KERNEL_GUARD_SIZE: usize = 4096;
-pub const KERNEL_SLOT_SIZE:  usize = KERNEL_GUARD_SIZE + KERNEL_STACK_SIZE; // 12 KB
+pub const KERNEL_SLOT_SIZE:  usize = KERNEL_GUARD_SIZE + KERNEL_STACK_SIZE; // 36 KB
 pub const MAX_KERNEL_STACKS: usize = 32;
 
 /// 4 KB-aligned wrapper for a single kernel-stack slot.
@@ -409,28 +409,41 @@ impl ProcessControlBlock {
         }
     }
 
-    /// Create a new ring-3 PCB using the IRETQ trampoline.
+    /// Initialize a ring-3 PCB directly into `out`, avoiding the large
+    /// hidden-return-value stack frame that `-> Option<Self>` creates in the
+    /// Windows x64 ABI (x86_64-unknown-uefi target).
     ///
-    /// When this process is first scheduled, the context switch executes `ret`
-    /// which pops `trampoline_addr` from the kernel stack and transfers control
-    /// to `ring3_entry_trampoline`.  That function reads `r12` (user entry) and
-    /// `r13` (user RSP) from the saved context and issues `iretq` to switch to
-    /// ring-3.
+    /// In the Windows x64 ABI a function returning a large struct passes a hidden
+    /// pointer as its first argument, causing the CALLER to allocate the full
+    /// struct on its own stack.  With `ProcessControlBlock` (~2.7 KB including
+    /// cap_table, user_frames, and mailbox), both `create_ring3_process` and the
+    /// old `new_ring3` needed ~11 KB + ~6 KB of combined stack — exceeding the
+    /// 16 KB kernel stack when added to `spawn_elf`'s own 5.7 KB frame.
     ///
-    /// `trampoline_addr` must be the address of `arch_x86_64::context::ring3_entry_trampoline`.
-    pub fn new_ring3(
-        pid:              ProcessId,
-        user_entry:       u64,
-        user_stack_top:   u64,
-        page_table_base:  u64,
-        trampoline_addr:  u64,
-    ) -> Option<Self> {
-        let (stack_id, _guard_addr, kern_stack_top) = alloc_kernel_stack()?;
+    /// By taking `&mut Option<Self>` instead, the PCB temporary lives in THIS
+    /// function's frame (~4 KB), and `create_ring3_process`'s frame shrinks to
+    /// ~400 bytes.  Total spawn-path depth is ~10 KB, safely within 16 KB.
+    ///
+    /// Returns `true` on success (`*out` is now `Some(initialized PCB)`).
+    /// Returns `false` if `alloc_kernel_stack` finds no free slot (`*out` unchanged).
+    ///
+    /// `trampoline_addr` must be `arch_x86_64::context::ring3_entry_trampoline as u64`.
+    pub fn new_ring3_into(
+        out:             &mut Option<Self>,
+        pid:             ProcessId,
+        user_entry:      u64,
+        user_stack_top:  u64,
+        page_table_base: u64,
+        trampoline_addr: u64,
+    ) -> bool {
+        let (stack_id, _guard_addr, kern_stack_top) = match alloc_kernel_stack() {
+            Some(x) => x,
+            None    => return false,
+        };
         // kern_rsp: 8 bytes below top; stores trampoline as fake return address.
         // kernel_rsp (→ TSS.RSP0): full stack top, so ring-3 interrupts have
         // a clean kernel stack to push the IRETQ frame onto.
         let kern_rsp = kern_stack_top - 8;
-        // Fake return address → trampoline (not directly to user entry).
         unsafe { *(kern_rsp as *mut u64) = trampoline_addr; }
 
         let mut ctx = TaskContext::zero();
@@ -440,7 +453,7 @@ impl ProcessControlBlock {
         ctx.r13    = user_stack_top;   // read by ring3_entry_trampoline
         ctx.rflags = 0x202;            // IF=1
 
-        Some(ProcessControlBlock {
+        *out = Some(ProcessControlBlock {
             pid,
             state:              ProcessState::Ready,
             priority:           128,
@@ -466,10 +479,10 @@ impl ProcessControlBlock {
             pml4_owned:         false, // set to true by spawn_elf via register_user_frames
             rt_period:          0,
             rt_deadline:        0,
-        })
+        });
+        true
     }
 
-    /// Create a new PCB.  `entry_point` is where the process starts executing.
     /// `user_stack_top` is the initial RSP for the process's user/kernel context.
     pub fn new(pid: ProcessId, entry_point: u64, _user_stack_top: u64, page_table_base: u64) -> Option<Self> {
         let (stack_id, _guard_addr, kern_stack_top) = alloc_kernel_stack()?;

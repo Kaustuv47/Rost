@@ -8,6 +8,35 @@
 
 use crate::io as serial;
 use crate::syscall::{Msg, recv_msg, send_msg};
+
+/// Receive a VFS response, discarding any non-VFS messages (e.g., keystrokes
+/// from uart-drv that arrived in the mailbox during IPC).  Returns `false` on
+/// timeout just like `recv_msg`.
+///
+/// When SYS_RECV_MSG has to block (mailbox empty), the kernel returns u64::MAX
+/// on wakeup regardless of whether the wakeup was caused by a message arriving
+/// or by the deadline expiring.  Execution resumes after switch_context_noints
+/// and the syscall returns u64::MAX — the message stays in the queue.  We
+/// therefore drain the queue with non-blocking polls (timeout=0) after any
+/// u64::MAX return before declaring a true timeout.
+#[inline(never)]
+fn recv_vfs_msg(timeout: u64, out: &mut Msg) -> bool {
+    loop {
+        if recv_msg(timeout, out) {
+            if out.sender as u64 == VFS_PID { return true; }
+            continue; // discard non-VFS message, re-enter blocking wait
+        }
+        // recv_msg returned false: either genuine timeout OR spurious wakeup.
+        // Drain the queue with non-blocking polls to distinguish.
+        loop {
+            if !recv_msg(0, out) {
+                return false; // queue empty → genuine timeout
+            }
+            if out.sender as u64 == VFS_PID { return true; }
+            // Non-VFS message arrived during the blocking wait; discard and keep draining.
+        }
+    }
+}
 use super::line_editor::{LineEditor, LINE_MAX};
 use super::history::History;
 use super::vars::VarStore;
@@ -23,7 +52,12 @@ use super::expand::{expand_history, expand_vars};
 // 512 KB covers typical release-mode server binaries.  Debug binaries are
 // larger; exec will report an error if the image does not fit.
 const EXEC_BUF_CAP: usize = 512 * 1024;
-static mut EXEC_BUF: [u8; EXEC_BUF_CAP] = [0u8; EXEC_BUF_CAP];
+
+// Page-aligned so SYS_PHYS_ADDR returns a page-aligned base that the ring-3
+// exec server can pass directly to SYS_MAP (which rejects non-aligned paddr).
+#[repr(align(4096))]
+struct ExecBufStorage([u8; EXEC_BUF_CAP]);
+static mut EXEC_BUF: ExecBufStorage = ExecBufStorage([0u8; EXEC_BUF_CAP]);
 
 // ── VFS IPC constants ─────────────────────────────────────────────────────────
 
@@ -526,7 +560,7 @@ fn path_complete(editor: &mut LineEditor, partial: &[u8], cwd: &[u8]) -> usize {
 
     loop {
         let mut resp = Msg::zeroed();
-        if !recv_msg(VFS_TIMEOUT, &mut resp) { break; }
+        if !recv_vfs_msg(VFS_TIMEOUT, &mut resp) { break; }
         match resp.data[0] {
             RESP_DONE => break,
             RESP_ENTRY => {
@@ -821,7 +855,7 @@ fn cmd_which(args: &Args<'_>, aliases: &AliasStore) {
     req.data[2..8].copy_from_slice(&pw);
     if send_msg(VFS_PID, &req) {
         let mut resp = Msg::zeroed();
-        if recv_msg(VFS_TIMEOUT, &mut resp) && resp.data[0] == RESP_STAT {
+        if recv_vfs_msg(VFS_TIMEOUT, &mut resp) && resp.data[0] == RESP_STAT {
             let flags = resp.data[1];
             if flags & 2 != 0 {
                 for &b in &path[..5 + nlen] { serial::put_byte(b); }
@@ -1059,7 +1093,7 @@ fn vfs_write_file(path: &[u8], flags: u8, data: &[u8]) -> bool {
     req.data[2..8].copy_from_slice(&pw);
     if !send_msg(VFS_PID, &req) { return false; }
     let mut resp = Msg::zeroed();
-    if !recv_msg(VFS_TIMEOUT, &mut resp) || resp.data[0] != RESP_OK { return false; }
+    if !recv_vfs_msg(VFS_TIMEOUT, &mut resp) || resp.data[0] != RESP_OK { return false; }
 
     // WRITE_DATA — send CHUNK_SIZE bytes per message
     let mut offset = 0usize;
@@ -1074,7 +1108,7 @@ fn vfs_write_file(path: &[u8], flags: u8, data: &[u8]) -> bool {
         req.data[2..8].copy_from_slice(&words);
         if !send_msg(VFS_PID, &req) { return false; }
         let mut resp = Msg::zeroed();
-        if !recv_msg(VFS_TIMEOUT, &mut resp) || resp.data[0] != RESP_OK { return false; }
+        if !recv_vfs_msg(VFS_TIMEOUT, &mut resp) || resp.data[0] != RESP_OK { return false; }
         offset = end;
     }
 
@@ -1083,7 +1117,7 @@ fn vfs_write_file(path: &[u8], flags: u8, data: &[u8]) -> bool {
     req.data[0] = OP_WRITE_CLOSE;
     if !send_msg(VFS_PID, &req) { return false; }
     let mut resp = Msg::zeroed();
-    recv_msg(VFS_TIMEOUT, &mut resp) && resp.data[0] == RESP_OK
+    recv_vfs_msg(VFS_TIMEOUT, &mut resp) && resp.data[0] == RESP_OK
 }
 
 fn cmd_touch(args: &Args<'_>, cwd: &[u8]) -> u64 {
@@ -1119,7 +1153,7 @@ fn cmd_mkdir(args: &Args<'_>, cwd: &[u8]) -> u64 {
         return 1;
     }
     let mut resp = Msg::zeroed();
-    if !recv_msg(VFS_TIMEOUT, &mut resp) {
+    if !recv_vfs_msg(VFS_TIMEOUT, &mut resp) {
         serial::print_str("mkdir: VFS timeout\n");
         return 1;
     }
@@ -1154,7 +1188,7 @@ fn cmd_rm(args: &Args<'_>, cwd: &[u8]) -> u64 {
         return 1;
     }
     let mut resp = Msg::zeroed();
-    if !recv_msg(VFS_TIMEOUT, &mut resp) {
+    if !recv_vfs_msg(VFS_TIMEOUT, &mut resp) {
         serial::print_str("rm: VFS timeout\n");
         return 1;
     }
@@ -1213,7 +1247,7 @@ fn cmd_exec(args: &Args<'_>, cwd: &[u8]) {
     // SAFETY: EXEC_BUF is only accessed from the single-threaded shell loop.
     // Use addr_of_mut! to avoid the Rust 2024 `static_mut_refs` lint.
     let buf: &mut [u8; EXEC_BUF_CAP] =
-        unsafe { &mut *core::ptr::addr_of_mut!(EXEC_BUF) };
+        unsafe { &mut (*core::ptr::addr_of_mut!(EXEC_BUF)).0 };
     let (res_buf, res_len) = resolve(cwd, path_raw);
     let (pw, _) = path_as_words(&res_buf[..res_len]);
 
@@ -1231,7 +1265,7 @@ fn cmd_exec(args: &Args<'_>, cwd: &[u8]) {
             return;
         }
         let mut resp = Msg::zeroed();
-        if !recv_msg(VFS_TIMEOUT, &mut resp) {
+        if !recv_vfs_msg(VFS_TIMEOUT, &mut resp) {
             serial::print_str("exec: VFS timeout\n");
             return;
         }
@@ -1278,8 +1312,14 @@ fn cmd_exec(args: &Args<'_>, cwd: &[u8]) {
         return;
     }
 
-    // ── Spawn via SYS_SPAWN_ELF ───────────────────────────────────────────────
-    match crate::syscall::spawn_elf(&buf[..file_len], priority) {
+    // ── Spawn via exec server (ring-3 ELF parser) or kernel fallback ─────────
+    // Prefer the ring-3 exec server: it does ELF parsing in user space.
+    // Falls back to SYS_SPAWN_ELF (kernel-mode ELF loader) if "exec" is not yet
+    // registered (e.g. very early in boot or exec server not running).
+    let new_pid = spawn_via_exec_server(buf, file_len, priority)
+        .or_else(|| crate::syscall::spawn_elf(&buf[..file_len], priority));
+
+    match new_pid {
         Some(pid) => {
             serial::print_str("exec: spawned PID ");
             print_u64(pid as u64);
@@ -1289,6 +1329,44 @@ fn cmd_exec(args: &Args<'_>, cwd: &[u8]) {
             serial::print_str("exec: failed to spawn process\n");
         }
     }
+}
+
+const EXEC_NAME: &[u8] = b"exec\0\0\0\0\0\0\0\0\0\0\0\0";
+const OP_EXEC:       u64 = 0x8000;
+const OP_EXEC_REPLY: u64 = 0x8001;
+
+/// Try to spawn an ELF via the ring-3 exec server.
+///
+/// Looks up the "exec" service, translates EXEC_BUF to a physical base address
+/// (the BSS pages are physically contiguous — allocated in one sequential run by
+/// the kernel's bitmap allocator during ELF loading), and sends a blocking IPC
+/// call to the exec server.
+///
+/// Returns `None` if the exec server is not registered or the call fails.
+fn spawn_via_exec_server(buf: &[u8; EXEC_BUF_CAP], file_len: usize, priority: u8) -> Option<u32> {
+    // Look up exec server PID.
+    let exec_pid = crate::syscall::lookup(EXEC_NAME);
+    if exec_pid >= u64::MAX - 7 { return None; } // not registered
+
+    // Translate the ELF buffer's first page to a physical address.
+    // Subsequent pages are physically contiguous (see module comment).
+    let phys_base = crate::syscall::phys_addr(buf.as_ptr() as u64)?;
+
+    let mut req = Msg::zeroed();
+    req.data[0] = OP_EXEC;
+    req.data[1] = phys_base;
+    req.data[2] = file_len as u64;
+    req.data[3] = priority as u64;
+
+    let mut reply = Msg::zeroed();
+    if !crate::syscall::call(exec_pid, &req, &mut reply, 500) {
+        // exec server timed out or mailbox full — caller will use kernel fallback
+        return None;
+    }
+    if reply.data[0] != OP_EXEC_REPLY { return None; }
+
+    let pid = reply.data[1] as u32;
+    if pid == u32::MAX { None } else { Some(pid) }
 }
 
 fn cmd_kill(args: &Args<'_>) -> u64 {
@@ -1333,7 +1411,7 @@ fn cmd_ls(args: &Args<'_>, cwd: &[u8]) {
     let mut found = false;
     loop {
         let mut resp = Msg::zeroed();
-        if !recv_msg(VFS_TIMEOUT, &mut resp) {
+        if !recv_vfs_msg(VFS_TIMEOUT, &mut resp) {
             serial::print_str("ls: VFS timeout\n");
             return;
         }
@@ -1394,7 +1472,7 @@ fn cmd_cat(args: &Args<'_>, cwd: &[u8]) {
         }
 
         let mut resp = Msg::zeroed();
-        if !recv_msg(VFS_TIMEOUT, &mut resp) {
+        if !recv_vfs_msg(VFS_TIMEOUT, &mut resp) {
             serial::print_str("cat: VFS timeout\n");
             return;
         }
@@ -1458,7 +1536,7 @@ fn cmd_mount() {
 
     loop {
         let mut resp = Msg::zeroed();
-        if !recv_msg(VFS_TIMEOUT, &mut resp) {
+        if !recv_vfs_msg(VFS_TIMEOUT, &mut resp) {
             serial::print_str("mount: VFS timeout\n");
             return;
         }
@@ -1499,7 +1577,7 @@ fn cmd_source(args: &Args<'_>, ctx: &mut ExecCtx<'_>) -> (Action, u64) {
         req.data[2..8].copy_from_slice(&pw);
         if !send_msg(VFS_PID, &req) { break; }
         let mut resp = Msg::zeroed();
-        if !recv_msg(VFS_TIMEOUT, &mut resp) { break; }
+        if !recv_vfs_msg(VFS_TIMEOUT, &mut resp) { break; }
         match resp.data[0] {
             RESP_DATA => {
                 if total == u64::MAX { total = resp.data[1]; }
@@ -1635,7 +1713,7 @@ fn vfs_stat_exists(path: &[u8]) -> bool {
     req.data[2..8].copy_from_slice(&pw);
     if !send_msg(VFS_PID, &req) { return false; }
     let mut resp = Msg::zeroed();
-    recv_msg(VFS_TIMEOUT, &mut resp) && resp.data[0] == RESP_STAT
+    recv_vfs_msg(VFS_TIMEOUT, &mut resp) && resp.data[0] == RESP_STAT
 }
 
 fn vfs_stat_isdir(path: &[u8]) -> bool {
@@ -1645,7 +1723,7 @@ fn vfs_stat_isdir(path: &[u8]) -> bool {
     req.data[2..8].copy_from_slice(&pw);
     if !send_msg(VFS_PID, &req) { return false; }
     let mut resp = Msg::zeroed();
-    if !recv_msg(VFS_TIMEOUT, &mut resp) { return false; }
+    if !recv_vfs_msg(VFS_TIMEOUT, &mut resp) { return false; }
     resp.data[0] == RESP_STAT && (resp.data[1] & 1 != 0)
 }
 

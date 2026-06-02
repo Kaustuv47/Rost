@@ -123,16 +123,14 @@ impl Shell {
         print_prompt(&self.editor, &self.cwd[..self.cwd_len]);
 
         loop {
-            if let Some(byte) = serial::read_byte() {
-                if let Some(key) = self.parser.feed(byte) {
-                    self.handle_key(key);
-                }
-            } else {
-                // No input — yield the CPU slice back to the kernel so other
-                // processes (uart-drv) can run and push keystrokes to our
-                // mailbox.  Using yield keeps us Ready so we are rescheduled
-                // at the very next tick rather than blocking for a full timeout.
-                crate::syscall::yield_cpu();
+            // Block until a byte arrives from uart-drv (or ps2-kbd).
+            // Using a true blocking receive (recv timeout=u64::MAX) means this
+            // process is Blocked while waiting, giving lower-priority processes
+            // (e.g. freshly-spawned user programs) a chance to run.  uart-drv
+            // unblocks us immediately when a key arrives via send_message().
+            let byte = serial::read_byte_blocking();
+            if let Some(key) = self.parser.feed(byte) {
+                self.handle_key(key);
             }
         }
     }

@@ -263,8 +263,8 @@ const USER_STACK_PAGES: usize = 32; // 128 KB — Shell struct ~20 KB + deep cal
 ///   * PDPT[0] entries [1..512] — virtual 1 GB–512 GB inside PML4[0]
 ///   * PD[0]   entries [1..512] — virtual 2 MB–1 GB inside PDPT[0]
 ///
-/// PD[0] (0–2 MB) is left untouched; user ELF segments always land there.
-/// Kernel code identity-maps from ~22 MB (PD[11+]) so there is no overlap.
+/// PD[0] (0–2 MB) is skipped here; the crash-log page at physical 0x4000
+/// is mapped via a dedicated `map_page_global` call in `spawn_elf`.
 ///
 /// Kernel entries are copied *without* `PTE_USER`, so ring-3 code cannot
 /// reach them and SMAP enforces the boundary.
@@ -288,9 +288,13 @@ unsafe fn merge_kernel_into_user_pml4(user_pml4_phys: u64) {
 
     // ── Step 2: PDPT entries [1..512] inside PML4[0] ────────────────────────
     if kern_pml4.entries[0] & PTE_PRESENT == 0 { return; }
-    if user_pml4.entries[0] & PTE_PRESENT == 0 { return; }
-
     let kern_pdpt = &*(( kern_pml4.entries[0] & PTE_ADDR_MASK) as *const PageTable);
+
+    if user_pml4.entries[0] & PTE_PRESENT == 0 {
+        let p = match core_kernel::memory::global_alloc_4k() { Some(a) => a, None => return };
+        core::ptr::write_bytes(p as *mut u8, 0, 4096);
+        user_pml4.entries[0] = p | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    }
     let user_pdpt = &mut *((user_pml4.entries[0] & PTE_ADDR_MASK) as *mut PageTable);
 
     for i in 1..512usize {
@@ -301,12 +305,17 @@ unsafe fn merge_kernel_into_user_pml4(user_pml4_phys: u64) {
 
     // ── Step 3: PD entries [1..512] inside PDPT[0] ──────────────────────────
     if kern_pdpt.entries[0] & PTE_PRESENT == 0 { return; }
-    if user_pdpt.entries[0] & PTE_PRESENT == 0 { return; }
-
     let kern_pd = &*(( kern_pdpt.entries[0] & PTE_ADDR_MASK) as *const PageTable);
+
+    if user_pdpt.entries[0] & PTE_PRESENT == 0 {
+        let p = match core_kernel::memory::global_alloc_4k() { Some(a) => a, None => return };
+        core::ptr::write_bytes(p as *mut u8, 0, 4096);
+        user_pdpt.entries[0] = p | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    }
     let user_pd = &mut *((user_pdpt.entries[0] & PTE_ADDR_MASK) as *mut PageTable);
 
-    // PD[0] covers 0–2 MB: user ELF lives here; we deliberately skip it.
+    // Skip PD[0] (0–2 MB) — user ELF segments live there.
+    // The crash-log page at 0x4000 is mapped explicitly below.
     for i in 1..512usize {
         if kern_pd.entries[i] & PTE_PRESENT != 0 && user_pd.entries[i] == 0 {
             user_pd.entries[i] = kern_pd.entries[i];
@@ -365,6 +374,10 @@ pub fn spawn_elf(data: &[u8], priority: u8) -> Option<core_kernel::process::Proc
     // Merge kernel page tables into user PML4 so that the syscall handler
     // can access kernel code/data/stacks when CR3 is the user's PML4.
     unsafe { merge_kernel_into_user_pml4(loaded.pml4_phys); }
+
+    // Map the crash-log page into the user PML4 so exception handlers can
+    // write to it when CR3 = user PML4.  Supervisor-only (no PTE_USER).
+    core_kernel::memory::map_crash_log_page(pml4);
 
     // Spawn the process using the ring-3 IRETQ trampoline.
     let trampoline = arch_x86_64::context::ring3_entry_trampoline as *const () as u64;

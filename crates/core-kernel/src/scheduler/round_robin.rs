@@ -143,6 +143,22 @@ impl Scheduler {
         }
     }
 
+    /// Append physical frames to a process's user-frame list **without** setting
+    /// `pml4_owned`.
+    ///
+    /// Used by `SYS_REGISTER_FRAMES` (38): the ring-3 exec server allocates ELF
+    /// segment pages via `SYS_ALLOC_PHYS` and registers them here so they are
+    /// reclaimed when the spawned process terminates.  Unlike `register_user_frames`,
+    /// this does not touch `pml4_owned` because the PML4 is already handled by
+    /// `SYS_SPAWN_WITH_VAS`.
+    pub fn append_user_frames(&self, pid: ProcessId, frames: &[u64]) {
+        if let Some(pcb) = self.process_table.borrow_mut().get_process(pid) {
+            for &frame in frames {
+                pcb.add_user_frame(frame);
+            }
+        }
+    }
+
     /// Set the priority of an already-registered process (0 = highest, 255 = lowest).
     pub fn set_priority(&self, pid: ProcessId, priority: u8) {
         if let Some(pcb) = self.process_table.borrow_mut().get_process(pid) {
@@ -315,6 +331,7 @@ impl Scheduler {
         if *idx >= at_min.len() { *idx = 0; }
         let next = at_min[*idx];
         *idx = (*idx + 1) % at_min.len();
+
         Some(next)
     }
 

@@ -2,7 +2,7 @@
 members = [
     "hello-world", "init", "libc", "net",
     "pci-bus", "block-drv", "gop", "ps2-kbd",
-    "shell", "uart-drv", "vfs",
+    "shell", "uart-drv", "vfs", "exec",
 ]
 resolver = "2"
 

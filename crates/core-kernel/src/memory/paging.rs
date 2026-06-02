@@ -132,6 +132,20 @@ pub fn map_page_global(
             let p = alloc_pt_frame()?;
             unsafe { core::ptr::write_bytes(p as *mut u8, 0, 4096); }
             *entry = (p & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | user_flag;
+        } else if *entry & PTE_HUGE_PAGE != 0 {
+            // PD entry is a 2 MB huge page — split it into 512 × 4 KB entries
+            // so subsequent PT-level mapping can proceed safely.
+            let huge_base = *entry & PTE_HUGE_ADDR_MASK;
+            let flags     = *entry & !PTE_HUGE_ADDR_MASK & !PTE_HUGE_PAGE;
+            let p = alloc_pt_frame()?;
+            unsafe {
+                core::ptr::write_bytes(p as *mut u8, 0, 4096);
+                let pt = p as *mut u64;
+                for i in 0..512usize {
+                    *pt.add(i) = (huge_base + i as u64 * 4096) | flags;
+                }
+            }
+            *entry = (p & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | user_flag;
         } else if user_flag != 0 && (*entry & PTE_USER == 0) {
             // Upgrade an existing supervisor-only entry to also allow user
             // access (can happen when a kernel PT is later reused for user).
@@ -370,6 +384,94 @@ pub fn translate_address(pml4: &PageTable, virt: u64) -> Option<u64> {
 
     if pt.entries[pt_idx] & PTE_PRESENT == 0 { return None; }
     Some((pt.entries[pt_idx] & PTE_ADDR_MASK) | (virt & 0xFFF))
+}
+
+/// Copy kernel page-table entries into a user-process PML4.
+///
+/// Needed so ring-3 processes have kernel mappings in their PML4 — SYSCALL
+/// handlers run with the user CR3 still active, so kernel code/data must be
+/// accessible from the user PML4.
+///
+/// Called from both `SYS_CREATE_VAS` (fresh empty PML4) and `spawn_elf`
+/// (after ELF segments are mapped).  When called on a fresh PML4,
+/// `user_pml4[0]` is zero; the function allocates a new PDPT and PD so
+/// that kernel PD entries (PD[1..512]) can always be merged, regardless
+/// of whether user-space mappings have been installed yet.
+///
+/// # Safety
+/// `user_pml4_phys` must be a valid, 4 KB-aligned frame.
+/// Identity mapping must hold (phys == virt) at the call site.
+pub unsafe fn merge_kernel_into_user_pml4(user_pml4_phys: u64) {
+    let kernel_pml4_phys = crate::scheduler::KERNEL_PML4_PHYS
+        .load(core::sync::atomic::Ordering::Relaxed);
+    if kernel_pml4_phys == 0 { return; }
+
+    let kern_pml4 = &*(kernel_pml4_phys as *const PageTable);
+    let user_pml4 = &mut *(user_pml4_phys as *mut PageTable);
+
+    // ── Step 1: PML4[1..512] (canonical kernel-half entries) ─────────────────
+    for i in 1..512usize {
+        if kern_pml4.entries[i] & PTE_PRESENT != 0 && user_pml4.entries[i] == 0 {
+            user_pml4.entries[i] = kern_pml4.entries[i];
+        }
+    }
+
+    // ── Step 2: PDPT[1..512] inside PML4[0] ──────────────────────────────────
+    if kern_pml4.entries[0] & PTE_PRESENT == 0 { return; }
+    let kern_pdpt = &*((kern_pml4.entries[0] & PTE_ADDR_MASK) as *const PageTable);
+
+    // Allocate a fresh PDPT for user_pml4[0] if one doesn't exist yet.
+    // This happens when merge is called on a blank PML4 (SYS_CREATE_VAS path)
+    // before any ELF segments have been mapped into the address space.
+    if user_pml4.entries[0] & PTE_PRESENT == 0 {
+        let p = match super::physical::global_alloc_4k() {
+            Some(addr) => addr,
+            None       => return, // OOM — leave without kernel PDPT entries
+        };
+        core::ptr::write_bytes(p as *mut u8, 0, 4096);
+        user_pml4.entries[0] = p | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    }
+    let user_pdpt = &mut *((user_pml4.entries[0] & PTE_ADDR_MASK) as *mut PageTable);
+
+    for i in 1..512usize {
+        if kern_pdpt.entries[i] & PTE_PRESENT != 0 && user_pdpt.entries[i] == 0 {
+            user_pdpt.entries[i] = kern_pdpt.entries[i];
+        }
+    }
+
+    // ── Step 3: PD[1..512] inside PDPT[0] ────────────────────────────────────
+    if kern_pdpt.entries[0] & PTE_PRESENT == 0 { return; }
+    let kern_pd = &*((kern_pdpt.entries[0] & PTE_ADDR_MASK) as *const PageTable);
+
+    // Allocate a fresh PD for user_pdpt[0] if one doesn't exist yet.
+    if user_pdpt.entries[0] & PTE_PRESENT == 0 {
+        let p = match super::physical::global_alloc_4k() {
+            Some(addr) => addr,
+            None       => return, // OOM
+        };
+        core::ptr::write_bytes(p as *mut u8, 0, 4096);
+        user_pdpt.entries[0] = p | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    }
+    let user_pd = &mut *((user_pdpt.entries[0] & PTE_ADDR_MASK) as *mut PageTable);
+
+    // Skip PD[0] (0–2 MB); the crash-log page at physical 0x4000 is mapped
+    // via a dedicated map_page_global call after this merge returns.
+    for i in 1..512usize {
+        if kern_pd.entries[i] & PTE_PRESENT != 0 && user_pd.entries[i] == 0 {
+            user_pd.entries[i] = kern_pd.entries[i];
+        }
+    }
+}
+
+/// Map the crash-log physical page into a user PML4 so exception handlers can
+/// write to it when CR3 = user PML4.  The page is supervisor-only (no PTE_USER).
+///
+/// Must be called after `merge_kernel_into_user_pml4` has ensured that PDPT[0]
+/// and PD[0] intermediate tables exist in the user PML4.
+pub fn map_crash_log_page(user_pml4: &mut PageTable) {
+    // Physical and virtual address of the crash log (identity mapped).
+    let addr = crate::crash_log::CRASH_LOG_PHYS;
+    map_page_global(user_pml4, addr, addr, PTE_PRESENT | PTE_WRITABLE);
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

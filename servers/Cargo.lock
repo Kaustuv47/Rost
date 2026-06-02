@@ -11,6 +11,10 @@ name = "rost-block-drv"
 version = "0.1.0"
 
 [[package]]
+name = "rost-exec"
+version = "0.1.0"
+
+[[package]]
 name = "rost-gop"
 version = "0.1.0"
 

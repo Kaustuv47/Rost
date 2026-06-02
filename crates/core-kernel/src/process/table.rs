@@ -121,11 +121,16 @@ impl ProcessTable {
         for slot in self.processes.iter_mut() {
             if slot.is_none() {
                 let pid = ProcessId::new(self.next_pid);
-                *slot = Some(ProcessControlBlock::new_ring3(
-                    pid, user_entry, user_stack_top, page_table_base, trampoline_addr,
-                )?);
-                self.next_pid += 1;
-                return Some(pid);
+                // new_ring3_into writes the PCB directly into *slot, avoiding the
+                // large hidden-return-value stack frame that -> Option<PCB> would
+                // create in the Windows x64 ABI (see ProcessControlBlock::new_ring3_into).
+                if ProcessControlBlock::new_ring3_into(
+                    slot, pid, user_entry, user_stack_top, page_table_base, trampoline_addr,
+                ) {
+                    self.next_pid += 1;
+                    return Some(pid);
+                }
+                return None; // alloc_kernel_stack exhausted
             }
         }
         None
@@ -194,6 +199,8 @@ impl ProcessTable {
         out
     }
 
+    /// Return the state of `pid` as a u8 (0=Ready,1=Running,2=Blocked,3=Terminated),
+    /// or None if the PID does not exist in the table.
     /// Return `(ProcessId, priority)` for every Ready process.
     /// Used by the priority scheduler to pick the highest-priority next task.
     pub fn get_ready_with_priority(&self) -> ProcList<(ProcessId, u8)> {
